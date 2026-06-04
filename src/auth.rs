@@ -76,6 +76,11 @@ impl OAuthConfig {
         self
     }
 
+    pub fn with_base_url(mut self, base_url: Url) -> Self {
+        self.base_url = ensure_directory_url(base_url);
+        self
+    }
+
     pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -377,8 +382,16 @@ impl OAuthClient {
     }
 
     fn endpoint(&self, path: &str) -> Result<Url> {
-        Ok(self.config.base_url.join(path)?)
+        Ok(ensure_directory_url(self.config.base_url.clone()).join(path)?)
     }
+}
+
+fn ensure_directory_url(mut url: Url) -> Url {
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    url
 }
 
 async fn decode_device_token_bad_request(response: reqwest::Response) -> Result<DeviceTokenStatus> {
@@ -605,6 +618,20 @@ mod tests {
         let query = url.query().unwrap();
         assert!(query.contains("code_challenge=challenge-1"));
         assert!(query.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn normalizes_oauth_base_url_as_directory() {
+        let mut config = OAuthConfig::new("client-id")
+            .unwrap()
+            .with_base_url(Url::parse("https://example.test/v1").unwrap());
+        assert_eq!(config.base_url.as_str(), "https://example.test/v1/");
+
+        config.base_url = Url::parse("https://example.test/oauth").unwrap();
+        let url = OAuthClient::new(config)
+            .authorization_url("state-1")
+            .unwrap();
+        assert_eq!(url.path(), "/oauth/authorize");
     }
 
     #[test]

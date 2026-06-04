@@ -350,11 +350,13 @@ pub struct CreateMembership {
     pub is_moderator: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateMembership {
-    pub is_moderator: bool,
-    pub is_room_hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_moderator: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_room_hidden: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -424,7 +426,7 @@ impl fmt::Debug for UpdateWebhook {
 mod tests {
     use serde_json::json;
 
-    use super::{CreateMessage, CreateWebhook};
+    use super::{CreateMessage, CreateWebhook, UpdateMembership};
 
     #[test]
     fn serializes_reply_message_body() {
@@ -450,6 +452,21 @@ mod tests {
             json!({
                 "toPersonEmail": "bot@example.com",
                 "text": "hi"
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_partial_membership_update() {
+        let body = serde_json::to_value(UpdateMembership {
+            is_moderator: Some(true),
+            is_room_hidden: None,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "isModerator": true
             })
         );
     }

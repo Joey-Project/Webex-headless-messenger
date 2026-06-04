@@ -18,7 +18,8 @@ pub struct PollingConfig {
     pub interval: Duration,
     pub page_size: u16,
     /// Maximum pages to fetch during one poll tick. If this limit is reached,
-    /// the poller stores the next page URL and resumes it on the next tick.
+    /// the poller stores the next page URL and buffers newer messages until it
+    /// can emit the full catch-up batch in chronological order.
     pub max_pages_per_poll: usize,
     pub emit_existing_on_first_poll: bool,
     /// Maximum message IDs retained for in-memory de-duplication. Values below
@@ -113,6 +114,7 @@ pub struct MessagePoller {
     config: PollingConfig,
     seen: SeenMessageIds,
     backlog_next: Option<Url>,
+    pending_fresh: Vec<ListMessage>,
     initialized: bool,
 }
 
@@ -124,6 +126,7 @@ impl MessagePoller {
             config: PollingConfig::default(),
             seen: SeenMessageIds::default(),
             backlog_next: None,
+            pending_fresh: Vec::new(),
             initialized: false,
         }
     }
@@ -134,8 +137,11 @@ impl MessagePoller {
     }
 
     pub async fn poll_once(&mut self) -> Result<Vec<ListMessage>> {
-        let mut page = if let Some(next) = self.backlog_next.take() {
-            self.client.next_page(next).await?
+        let continuing_backlog = self.backlog_next.is_some();
+        let mut page = if let Some(next) = self.backlog_next.clone() {
+            let page = self.client.next_page(next).await?;
+            self.backlog_next = None;
+            page
         } else {
             let mut params = ListMessages::room(self.room_id.clone());
             params.max = Some(self.config.page_size);
@@ -143,7 +149,11 @@ impl MessagePoller {
         };
         let max_pages = self.config.max_pages_per_poll.max(1);
 
-        let mut fresh = Vec::new();
+        let mut fresh = if continuing_backlog {
+            std::mem::take(&mut self.pending_fresh)
+        } else {
+            Vec::new()
+        };
         for page_index in 0..max_pages {
             let (mut page_fresh, saw_known_message) = collect_page_messages(
                 &mut self.seen,
@@ -164,13 +174,17 @@ impl MessagePoller {
             };
             if page_index + 1 >= max_pages {
                 if self.initialized || self.config.emit_existing_on_first_poll {
+                    self.pending_fresh = fresh;
                     self.backlog_next = Some(next);
+                    self.initialized = true;
+                    return Ok(Vec::new());
                 }
                 break;
             }
             page = self.client.next_page(next).await?;
         }
 
+        self.pending_fresh.clear();
         self.initialized = true;
         fresh.reverse();
         Ok(fresh)
