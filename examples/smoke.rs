@@ -6,8 +6,8 @@ use std::{
 
 #[cfg(unix)]
 use std::{
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
 use tokio::time::sleep;
@@ -104,8 +104,7 @@ async fn main() -> webex_headless_messenger::Result<()> {
 
 async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Result<TokenSet> {
     let token_path = PathBuf::from(TOKEN_FILE);
-    if let Ok(contents) = tokio::fs::read_to_string(&token_path).await {
-        harden_token_cache_permissions(&token_path)?;
+    if let Some(contents) = read_token_cache(&token_path)? {
         let token = serde_json::from_str::<TokenSet>(&contents)?;
         if !token.is_expiring_within(Duration::from_secs(300)) {
             println!("token_cache=hit");
@@ -235,24 +234,44 @@ fn push_candidate(candidates: &mut Vec<String>, value: &str) {
 }
 
 #[cfg(unix)]
-fn harden_token_cache_permissions(path: &Path) -> webex_headless_messenger::Result<()> {
+fn read_token_cache(path: &Path) -> webex_headless_messenger::Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    validate_owned_regular_file(path, &metadata)?;
     if let Some(parent) = path.parent() {
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        harden_owned_directory(parent)?;
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    validate_owned_regular_file(path, &metadata)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(Some(contents))
 }
 
 #[cfg(not(unix))]
-fn harden_token_cache_permissions(_path: &Path) -> webex_headless_messenger::Result<()> {
-    Ok(())
+fn read_token_cache(path: &Path) -> webex_headless_messenger::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(unix)]
 fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        harden_owned_directory(parent)?;
     }
 
     let temp_path = path.with_extension(format!(
@@ -270,6 +289,7 @@ fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::R
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&temp_path)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
@@ -277,6 +297,51 @@ fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::R
     std::fs::rename(&temp_path, path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_owned_regular_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> webex_headless_messenger::Result<()> {
+    if !metadata.file_type().is_file() {
+        return Err(webex_headless_messenger::Error::Other(format!(
+            "refusing to read token cache at {} because it is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.uid() != effective_uid() {
+        return Err(webex_headless_messenger::Error::Other(format!(
+            "refusing to read token cache at {} because it is not owned by the current user",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_owned_directory(path: &Path) -> webex_headless_messenger::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(webex_headless_messenger::Error::Other(format!(
+            "refusing to use token cache directory {} because it is not a directory",
+            path.display()
+        )));
+    }
+    if metadata.uid() != effective_uid() {
+        return Err(webex_headless_messenger::Error::Other(format!(
+            "refusing to use token cache directory {} because it is not owned by the current user",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]

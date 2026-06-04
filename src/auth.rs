@@ -34,7 +34,7 @@ pub struct OAuthConfig {
     pub client_secret: Option<String>,
     pub redirect_uri: Option<Url>,
     pub scopes: Vec<String>,
-    pub base_url: Url,
+    base_url: Url,
 }
 
 impl fmt::Debug for OAuthConfig {
@@ -92,6 +92,10 @@ impl OAuthConfig {
 
     pub fn scope_string(&self) -> String {
         self.scopes.join(" ")
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
     }
 }
 
@@ -316,14 +320,17 @@ impl OAuthClient {
     }
 
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
+        let Some(client_secret) = &self.config.client_secret else {
+            return Err(Error::Other(
+                "client_secret is required for Webex token refresh".to_owned(),
+            ));
+        };
         let mut form = vec![
             ("grant_type", "refresh_token".to_owned()),
             ("client_id", self.config.client_id.clone()),
             ("refresh_token", refresh_token.to_owned()),
         ];
-        if let Some(client_secret) = &self.config.client_secret {
-            form.push(("client_secret", client_secret.clone()));
-        }
+        form.push(("client_secret", client_secret.clone()));
         self.post_token_form("access_token", &form).await
     }
 
@@ -625,13 +632,21 @@ mod tests {
         let mut config = OAuthConfig::new("client-id")
             .unwrap()
             .with_base_url(Url::parse("https://example.test/v1").unwrap());
-        assert_eq!(config.base_url.as_str(), "https://example.test/v1/");
+        assert_eq!(config.base_url().as_str(), "https://example.test/v1/");
 
         config.base_url = Url::parse("https://example.test/oauth").unwrap();
         let url = OAuthClient::new(config)
             .authorization_url("state-1")
             .unwrap();
         assert_eq!(url.path(), "/oauth/authorize");
+    }
+
+    #[tokio::test]
+    async fn refresh_token_requires_client_secret() {
+        let oauth = OAuthClient::new(OAuthConfig::new("client-id").unwrap());
+        let error = oauth.refresh_token("refresh-token").await.unwrap_err();
+
+        assert!(matches!(error, crate::Error::Other(message) if message.contains("client_secret")));
     }
 
     #[test]

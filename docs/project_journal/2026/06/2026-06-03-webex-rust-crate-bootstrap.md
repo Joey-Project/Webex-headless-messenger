@@ -26,6 +26,7 @@ superseded_by:
 - PR review fix-loop 已处理：默认 OAuth scope 补 `spark:kms`，Authorization Code helper 补 PKCE API，Device Token 错误解析覆盖 Webex `errors[0].description`/`message` 形态，poller 去重缓存加容量上限，smoke token cache 在 Unix 上以 owner-only 权限写入。
 - 第二轮 PR review fix-loop 已处理：smoke 示例在 cache hit 路径也会收紧既有 token cache 权限，`slow_down` 使用独立 `DeviceTokenStatus::SlowDown` 变体并在示例中递增后续 polling interval。
 - 第三轮 GitHub Codex review fix-loop 已处理：OAuth 自定义 base URL join 前统一按目录 URL 规范化，membership update 字段改为 partial serialization，poller 在 backlog 跨 tick 时先缓冲较新的消息，直到较旧 backlog drain 完成后再按时间顺序返回。
+- 第四轮 review fix-loop 已处理：OAuth refresh 缺 client secret 时本地早失败，poller 只在完整 catch-up batch 可返回时提交 seen IDs 且错误时保留 pending backlog，smoke token cache hit 改为 no-follow/owner/regular-file 校验后再读取。
 
 ## Next Steps
 - 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。
