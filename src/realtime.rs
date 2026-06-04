@@ -108,6 +108,10 @@ fn collect_page_messages(
     (fresh, new_ids, saw_known_message)
 }
 
+fn preserve_pending_on_page_error(initialized: bool, emit_existing_on_first_poll: bool) -> bool {
+    initialized || emit_existing_on_first_poll
+}
+
 /// Simple room message poller with in-memory de-duplication.
 #[derive(Clone)]
 pub struct MessagePoller {
@@ -194,12 +198,15 @@ impl MessagePoller {
             page = match self.client.next_page(next.clone()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    if self.initialized || self.config.emit_existing_on_first_poll {
+                    if preserve_pending_on_page_error(
+                        self.initialized,
+                        self.config.emit_existing_on_first_poll,
+                    ) {
                         self.pending_fresh = fresh;
                         self.pending_seen_ids = new_ids;
                         self.backlog_next = Some(next);
+                        self.initialized = true;
                     }
-                    self.initialized = true;
                     return Err(error);
                 }
             };
@@ -246,7 +253,7 @@ mod tests {
 
     use crate::types::Message;
 
-    use super::{SeenMessageIds, collect_page_messages};
+    use super::{SeenMessageIds, collect_page_messages, preserve_pending_on_page_error};
 
     #[test]
     fn seen_message_ids_keep_newest_ids_from_api_order() {
@@ -330,6 +337,29 @@ mod tests {
         assert!(seen.ids.contains("page-1-newest"));
         assert!(seen.ids.contains("page-1-older"));
         assert!(!seen.ids.contains("page-2-older"));
+    }
+
+    #[test]
+    fn initial_poll_error_does_not_commit_seen_boundary() {
+        let seen = SeenMessageIds::default();
+        let mut local_seen_ids = HashSet::new();
+        let (_, new_ids, _) = collect_page_messages(
+            &seen,
+            vec![message("existing-newest"), message("existing-older")],
+            false,
+            false,
+            &mut local_seen_ids,
+        );
+
+        assert_eq!(new_ids, ["existing-newest", "existing-older"]);
+        assert!(!seen.ids.contains("existing-newest"));
+    }
+
+    #[test]
+    fn initial_default_page_error_retries_baseline() {
+        assert!(!preserve_pending_on_page_error(false, false));
+        assert!(preserve_pending_on_page_error(true, false));
+        assert!(preserve_pending_on_page_error(false, true));
     }
 
     fn message(id: &str) -> Message {
