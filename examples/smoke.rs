@@ -105,6 +105,7 @@ async fn main() -> webex_headless_messenger::Result<()> {
 async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Result<TokenSet> {
     let token_path = PathBuf::from(TOKEN_FILE);
     if let Ok(contents) = tokio::fs::read_to_string(&token_path).await {
+        harden_token_cache_permissions(&token_path)?;
         let token = serde_json::from_str::<TokenSet>(&contents)?;
         if !token.is_expiring_within(Duration::from_secs(300)) {
             println!("token_cache=hit");
@@ -120,7 +121,7 @@ async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Res
         println!("verification_uri_complete={complete}");
     }
 
-    let interval = Duration::from_secs(auth.interval.unwrap_or(5));
+    let mut interval = Duration::from_secs(auth.interval.unwrap_or(5));
     loop {
         match oauth.poll_device_token(&auth.device_code).await? {
             DeviceTokenStatus::Authorized(token) => {
@@ -130,6 +131,10 @@ async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Res
                 return Ok(token);
             }
             DeviceTokenStatus::Pending { retry_after } => {
+                sleep(retry_after.unwrap_or(interval)).await;
+            }
+            DeviceTokenStatus::SlowDown { retry_after } => {
+                interval += Duration::from_secs(5);
                 sleep(retry_after.unwrap_or(interval)).await;
             }
         }
@@ -227,6 +232,20 @@ fn push_candidate(candidates: &mut Vec<String>, value: &str) {
     {
         candidates.push(value.to_owned());
     }
+}
+
+#[cfg(unix)]
+fn harden_token_cache_permissions(path: &Path) -> webex_headless_messenger::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_token_cache_permissions(_path: &Path) -> webex_headless_messenger::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]

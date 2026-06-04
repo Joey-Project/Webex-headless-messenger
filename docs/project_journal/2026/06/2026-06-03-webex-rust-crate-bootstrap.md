@@ -24,6 +24,7 @@ superseded_by:
 - README 已替换模板内容，写明 scope、使用示例和 WebSocket 边界。
 - 内部 reviewer findings 已处理：普通依赖启用 `tokio/rt`、poller 使用 backlog continuation 追分页、token/secret Debug 脱敏、Device Token pending/slow_down 处理、默认与扩展 scope 分离、pagination host 限制。最终 reviewer 复查为 no findings。
 - PR review fix-loop 已处理：默认 OAuth scope 补 `spark:kms`，Authorization Code helper 补 PKCE API，Device Token 错误解析覆盖 Webex `errors[0].description`/`message` 形态，poller 去重缓存加容量上限，smoke token cache 在 Unix 上以 owner-only 权限写入。
+- 第二轮 PR review fix-loop 已处理：smoke 示例在 cache hit 路径也会收紧既有 token cache 权限，`slow_down` 使用独立 `DeviceTokenStatus::SlowDown` 变体并在示例中递增后续 polling interval。
 
 ## Next Steps
 - 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。

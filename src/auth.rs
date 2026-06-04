@@ -190,6 +190,7 @@ pub struct DeviceAuthorization {
 #[derive(Debug, Clone)]
 pub enum DeviceTokenStatus {
     Pending { retry_after: Option<Duration> },
+    SlowDown { retry_after: Option<Duration> },
     Authorized(TokenSet),
 }
 
@@ -390,8 +391,8 @@ async fn decode_device_token_bad_request(response: reqwest::Response) -> Result<
         Some("authorization_pending") => Ok(DeviceTokenStatus::Pending {
             retry_after: parse_retry_after(&headers),
         }),
-        Some("slow_down") => Ok(DeviceTokenStatus::Pending {
-            retry_after: parse_retry_after(&headers).or(Some(Duration::from_secs(5))),
+        Some("slow_down") => Ok(DeviceTokenStatus::SlowDown {
+            retry_after: parse_retry_after(&headers),
         }),
         _ => Err(ApiError::from_status_body(status, &headers, body).into()),
     }

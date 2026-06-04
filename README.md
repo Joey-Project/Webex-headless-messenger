@@ -121,6 +121,7 @@ async fn main() -> webex_headless_messenger::Result<()> {
     let auth = oauth.start_device_authorization().await?;
     println!("Open {} and enter {}", auth.verification_uri, auth.user_code);
 
+    let mut interval = Duration::from_secs(auth.interval.unwrap_or(5));
     loop {
         match oauth.poll_device_token(&auth.device_code).await? {
             DeviceTokenStatus::Authorized(tokens) => {
@@ -128,7 +129,11 @@ async fn main() -> webex_headless_messenger::Result<()> {
                 break;
             }
             DeviceTokenStatus::Pending { retry_after } => {
-                sleep(retry_after.unwrap_or(Duration::from_secs(auth.interval.unwrap_or(5)))).await;
+                sleep(retry_after.unwrap_or(interval)).await;
+            }
+            DeviceTokenStatus::SlowDown { retry_after } => {
+                interval += Duration::from_secs(5);
+                sleep(retry_after.unwrap_or(interval)).await;
             }
         }
     }

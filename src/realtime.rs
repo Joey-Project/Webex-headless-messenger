@@ -45,25 +45,64 @@ struct SeenMessageIds {
 }
 
 impl SeenMessageIds {
-    fn insert(&mut self, id: String, max_ids: usize) -> bool {
-        if self.ids.contains(&id) {
-            return false;
-        }
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
 
-        self.ids.insert(id.clone());
-        self.order.push_back(id);
-
+    fn remember_newest_first<I>(&mut self, ids: I, max_ids: usize)
+    where
+        I: IntoIterator<Item = String>,
+        I::IntoIter: DoubleEndedIterator,
+    {
         let max_ids = max_ids.max(1);
-        while self.ids.len() > max_ids {
-            if let Some(stale) = self.order.pop_front() {
-                self.ids.remove(&stale);
-            } else {
-                break;
+
+        for id in ids.into_iter().rev() {
+            if self.ids.insert(id.clone()) {
+                self.order.push_front(id);
+            }
+
+            while self.ids.len() > max_ids {
+                if let Some(stale) = self.order.pop_back() {
+                    self.ids.remove(&stale);
+                } else {
+                    break;
+                }
             }
         }
-
-        true
     }
+}
+
+fn collect_page_messages(
+    seen: &mut SeenMessageIds,
+    items: Vec<ListMessage>,
+    initialized: bool,
+    emit_existing_on_first_poll: bool,
+    max_seen_ids: usize,
+) -> (Vec<ListMessage>, bool) {
+    let mut fresh = Vec::new();
+    let mut new_ids = Vec::new();
+    let mut saw_known_message = false;
+
+    for message in items {
+        let Some(id) = message.id.clone() else {
+            continue;
+        };
+        if seen.contains(&id) {
+            saw_known_message = true;
+            if initialized {
+                break;
+            }
+            continue;
+        }
+
+        new_ids.push(id);
+        if initialized || emit_existing_on_first_poll {
+            fresh.push(message);
+        }
+    }
+
+    seen.remember_newest_first(new_ids, max_seen_ids);
+    (fresh, saw_known_message)
 }
 
 /// Simple room message poller with in-memory de-duplication.
@@ -106,17 +145,14 @@ impl MessagePoller {
 
         let mut fresh = Vec::new();
         for page_index in 0..max_pages {
-            let mut saw_known_message = false;
-            for message in page.items {
-                let Some(id) = message.id.clone() else {
-                    continue;
-                };
-                let is_new = self.seen.insert(id, self.config.max_seen_ids);
-                saw_known_message |= !is_new;
-                if is_new && (self.initialized || self.config.emit_existing_on_first_poll) {
-                    fresh.push(message);
-                }
-            }
+            let (mut page_fresh, saw_known_message) = collect_page_messages(
+                &mut self.seen,
+                page.items,
+                self.initialized,
+                self.config.emit_existing_on_first_poll,
+                self.config.max_seen_ids,
+            );
+            fresh.append(&mut page_fresh);
 
             if saw_known_message && self.initialized {
                 self.backlog_next = None;
@@ -168,20 +204,63 @@ impl MessagePoller {
 
 #[cfg(test)]
 mod tests {
-    use super::SeenMessageIds;
+    use crate::types::Message;
+
+    use super::{SeenMessageIds, collect_page_messages};
 
     #[test]
-    fn seen_message_ids_are_capacity_bound() {
+    fn seen_message_ids_keep_newest_ids_from_api_order() {
         let mut seen = SeenMessageIds::default();
 
-        assert!(seen.insert("a".to_owned(), 2));
-        assert!(seen.insert("b".to_owned(), 2));
-        assert!(seen.insert("c".to_owned(), 2));
+        seen.remember_newest_first(
+            vec![
+                "newest".to_owned(),
+                "middle".to_owned(),
+                "oldest".to_owned(),
+            ],
+            2,
+        );
 
         assert_eq!(seen.ids.len(), 2);
-        assert!(!seen.ids.contains("a"));
-        assert!(seen.ids.contains("b"));
-        assert!(seen.ids.contains("c"));
-        assert!(seen.insert("a".to_owned(), 2));
+        assert!(seen.ids.contains("newest"));
+        assert!(seen.ids.contains("middle"));
+        assert!(!seen.ids.contains("oldest"));
+    }
+
+    #[test]
+    fn page_scan_stops_at_known_boundary_before_retaining_new_ids() {
+        let mut seen = SeenMessageIds::default();
+        seen.remember_newest_first(vec!["known-newest".to_owned()], 1);
+
+        let (fresh, saw_known) = collect_page_messages(
+            &mut seen,
+            vec![
+                message("new-2"),
+                message("new-1"),
+                message("known-newest"),
+                message("old-duplicate"),
+            ],
+            true,
+            false,
+            1,
+        );
+
+        assert!(saw_known);
+        assert_eq!(
+            fresh
+                .iter()
+                .map(|message| message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["new-2", "new-1"]
+        );
+        assert!(seen.ids.contains("new-2"));
+        assert!(!seen.ids.contains("old-duplicate"));
+    }
+
+    fn message(id: &str) -> Message {
+        Message {
+            id: Some(id.to_owned()),
+            ..Message::default()
+        }
     }
 }
