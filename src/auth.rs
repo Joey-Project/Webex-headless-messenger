@@ -284,7 +284,7 @@ impl OAuthClient {
     }
 
     pub async fn exchange_authorization_code(&self, code: &str) -> Result<TokenSet> {
-        let form = self.authorization_code_form(code, None);
+        let form = self.authorization_code_form(code, None)?;
         self.post_token_form("access_token", &form).await
     }
 
@@ -293,7 +293,7 @@ impl OAuthClient {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenSet> {
-        let form = self.authorization_code_form(code, Some(code_verifier));
+        let form = self.authorization_code_form(code, Some(code_verifier))?;
         self.post_token_form("access_token", &form).await
     }
 
@@ -301,22 +301,25 @@ impl OAuthClient {
         &self,
         code: &str,
         code_verifier: Option<&str>,
-    ) -> Vec<(&'static str, String)> {
+    ) -> Result<Vec<(&'static str, String)>> {
+        let Some(client_secret) = &self.config.client_secret else {
+            return Err(Error::Other(
+                "client_secret is required for Webex authorization code exchange".to_owned(),
+            ));
+        };
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
             ("client_id", self.config.client_id.clone()),
             ("code", code.to_owned()),
         ];
-        if let Some(client_secret) = &self.config.client_secret {
-            form.push(("client_secret", client_secret.clone()));
-        }
+        form.push(("client_secret", client_secret.clone()));
         if let Some(redirect_uri) = &self.config.redirect_uri {
             form.push(("redirect_uri", redirect_uri.to_string()));
         }
         if let Some(code_verifier) = code_verifier {
             form.push(("code_verifier", code_verifier.to_owned()));
         }
-        form
+        Ok(form)
     }
 
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
@@ -649,13 +652,26 @@ mod tests {
         assert!(matches!(error, crate::Error::Other(message) if message.contains("client_secret")));
     }
 
+    #[tokio::test]
+    async fn authorization_code_exchange_requires_client_secret() {
+        let oauth = OAuthClient::new(OAuthConfig::new("client-id").unwrap());
+        let error = oauth
+            .exchange_authorization_code("authorization-code")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::Error::Other(message) if message.contains("client_secret")));
+    }
+
     #[test]
     fn builds_authorization_code_form_with_pkce() {
         let config = OAuthConfig::new("client-id")
             .unwrap()
             .with_client_secret("client-secret")
             .with_redirect_uri(Url::parse("http://localhost:8080/callback").unwrap());
-        let form = OAuthClient::new(config).authorization_code_form("code-1", Some("verifier-1"));
+        let form = OAuthClient::new(config)
+            .authorization_code_form("code-1", Some("verifier-1"))
+            .unwrap();
 
         assert!(
             form.iter()

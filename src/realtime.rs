@@ -112,6 +112,10 @@ fn preserve_pending_on_page_error(initialized: bool, emit_existing_on_first_poll
     initialized || emit_existing_on_first_poll
 }
 
+fn effective_poll_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(1))
+}
+
 /// Simple room message poller with in-memory de-duplication.
 #[derive(Clone)]
 pub struct MessagePoller {
@@ -224,7 +228,7 @@ impl MessagePoller {
     pub fn spawn(mut self) -> mpsc::Receiver<Result<ListMessage>> {
         let (sender, receiver) = mpsc::channel(256);
         tokio::spawn(async move {
-            let mut interval = time::interval(self.config.interval);
+            let mut interval = time::interval(effective_poll_interval(self.config.interval));
             loop {
                 interval.tick().await;
                 match self.poll_once().await {
@@ -249,11 +253,14 @@ impl MessagePoller {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, time::Duration};
 
     use crate::types::Message;
 
-    use super::{SeenMessageIds, collect_page_messages, preserve_pending_on_page_error};
+    use super::{
+        SeenMessageIds, collect_page_messages, effective_poll_interval,
+        preserve_pending_on_page_error,
+    };
 
     #[test]
     fn seen_message_ids_keep_newest_ids_from_api_order() {
@@ -360,6 +367,18 @@ mod tests {
         assert!(!preserve_pending_on_page_error(false, false));
         assert!(preserve_pending_on_page_error(true, false));
         assert!(preserve_pending_on_page_error(false, true));
+    }
+
+    #[test]
+    fn zero_poll_interval_is_clamped() {
+        assert_eq!(
+            effective_poll_interval(Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            effective_poll_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
     }
 
     fn message(id: &str) -> Message {

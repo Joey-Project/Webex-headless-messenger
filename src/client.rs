@@ -321,7 +321,7 @@ impl WebexClient {
         if next.scheme() == self.base_url.scheme()
             && next.host_str() == self.base_url.host_str()
             && next.port_or_known_default() == self.base_url.port_or_known_default()
-            && next.path().starts_with(self.base_url.path())
+            && is_same_or_child_path(next.path(), self.base_url.path())
         {
             Ok(())
         } else {
@@ -376,6 +376,10 @@ fn ensure_directory_url(mut url: Url) -> Url {
     url
 }
 
+fn is_same_or_child_path(path: &str, base_path: &str) -> bool {
+    path == base_path || path.starts_with(base_path)
+}
+
 #[derive(Serialize)]
 struct NoQuery {}
 
@@ -383,7 +387,7 @@ struct NoQuery {}
 mod tests {
     use url::Url;
 
-    use super::{WebexClient, encode_segment, ensure_directory_url};
+    use super::{WebexClient, encode_segment, ensure_directory_url, is_same_or_child_path};
 
     #[test]
     fn encodes_path_segments() {
@@ -421,5 +425,14 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_sibling_pagination_path_prefixes() {
+        assert!(is_same_or_child_path("/webex/v1/messages", "/webex/v1/"));
+        assert!(!is_same_or_child_path(
+            "/webex/v1evil/messages",
+            "/webex/v1/"
+        ));
     }
 }
