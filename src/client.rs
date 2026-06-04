@@ -321,11 +321,12 @@ impl WebexClient {
         if next.scheme() == self.base_url.scheme()
             && next.host_str() == self.base_url.host_str()
             && next.port_or_known_default() == self.base_url.port_or_known_default()
+            && next.path().starts_with(self.base_url.path())
         {
             Ok(())
         } else {
             Err(Error::Other(format!(
-                "refusing to send Webex bearer token to pagination URL outside configured base host: {next}"
+                "refusing to send Webex bearer token to pagination URL outside configured base URL: {next}"
             )))
         }
     }
@@ -382,7 +383,7 @@ struct NoQuery {}
 mod tests {
     use url::Url;
 
-    use super::{encode_segment, ensure_directory_url};
+    use super::{WebexClient, encode_segment, ensure_directory_url};
 
     #[test]
     fn encodes_path_segments() {
@@ -395,6 +396,30 @@ mod tests {
         assert_eq!(
             base.join("messages").unwrap().as_str(),
             "https://webexapis.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn rejects_pagination_urls_outside_base_path() {
+        let client = WebexClient {
+            http: reqwest::Client::new(),
+            base_url: ensure_directory_url(Url::parse("https://gateway.example/webex/v1").unwrap()),
+            token_provider: std::sync::Arc::new(crate::auth::StaticTokenProvider::new("token")),
+        };
+
+        assert!(
+            client
+                .validate_page_url(
+                    &Url::parse("https://gateway.example/webex/v1/messages").unwrap()
+                )
+                .is_ok()
+        );
+        assert!(
+            client
+                .validate_page_url(
+                    &Url::parse("https://gateway.example/other/v1/messages").unwrap()
+                )
+                .is_err()
         );
     }
 }

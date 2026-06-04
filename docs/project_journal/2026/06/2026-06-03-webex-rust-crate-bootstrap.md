@@ -28,6 +28,7 @@ superseded_by:
 - 第三轮 GitHub Codex review fix-loop 已处理：OAuth 自定义 base URL join 前统一按目录 URL 规范化，membership update 字段改为 partial serialization，poller 在 backlog 跨 tick 时先缓冲较新的消息，直到较旧 backlog drain 完成后再按时间顺序返回。
 - 第四轮 review fix-loop 已处理：OAuth refresh 缺 client secret 时本地早失败，poller 只在完整 catch-up batch 可返回时提交 seen IDs 且错误时保留 pending backlog，smoke token cache hit 改为 no-follow/owner/regular-file 校验后再读取。
 - 第五轮 review fix-loop 已处理：默认首轮 skip-existing baseline 建立期间如果后续分页失败，poller 保持未初始化并从头重试 baseline，避免下一轮把历史消息当 fresh 发出。
+- 第六轮 review fix-loop 已处理：REST pagination `next` URL 校验扩展到 configured base path 前缀，避免 path-based proxy 场景把 bearer token 发到同 host 的非 Webex 路径。
 
 ## Next Steps
 - 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。
