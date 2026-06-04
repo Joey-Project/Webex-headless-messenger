@@ -47,8 +47,10 @@ spark:messages_write
 spark:rooms_read
 spark:memberships_read
 spark:people_read
+spark:kms
 ```
 
+`spark:kms` is required by Webex for encrypted content such as messages.
 `spark:all` is not required for the REST client. Compliance scopes are a
 separate organization-wide model and are intentionally not the default.
 
@@ -69,6 +71,9 @@ For Device Grant Flow, the Webex Integration must include Cisco's OAuth helper
 service redirect URIs documented by Webex. Device Token polling also requires
 the integration client secret because Webex expects HTTP Basic authentication on
 that endpoint.
+
+Authorization Code helpers include PKCE support through
+`authorization_url_with_pkce` and `exchange_authorization_code_with_pkce`.
 
 ## Quick Start
 
@@ -178,7 +183,8 @@ cargo run --example smoke --all-features
 ```
 
 The example starts Device Grant Flow, stores the resulting token in
-`.codex-tmp/webex-smoke/token.json`, resolves the test room from
+`.codex-tmp/webex-smoke/token.json` with owner-only file permissions on Unix,
+resolves the test room from
 `WEBEX_TEST_ROOM_ID`, candidates parsed from `WEBEX_TEST_ROOM_LINK`, or a unique
 `WEBEX_TEST_ROOM_TITLE`, then performs read/send/reply smoke checks.
 

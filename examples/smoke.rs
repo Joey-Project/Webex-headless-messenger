@@ -1,4 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::{
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 use tokio::time::sleep;
 use url::Url;
@@ -114,11 +124,8 @@ async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Res
     loop {
         match oauth.poll_device_token(&auth.device_code).await? {
             DeviceTokenStatus::Authorized(token) => {
-                if let Some(parent) = token_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
                 let serialized = serde_json::to_string_pretty(&token)?;
-                tokio::fs::write(&token_path, serialized).await?;
+                write_token_cache(&token_path, &serialized)?;
                 println!("token_cache=stored");
                 return Ok(token);
             }
@@ -220,6 +227,46 @@ fn push_candidate(candidates: &mut Vec<String>, value: &str) {
     {
         candidates.push(value.to_owned());
     }
+}
+
+#[cfg(unix)]
+fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let temp_path = path.with_extension(format!(
+        "{}.tmp.{}",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("json"),
+        std::process::id()
+    ));
+    if temp_path.exists() {
+        std::fs::remove_file(&temp_path)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temp_path, path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    Ok(())
 }
 
 fn read_env(path: &str) -> webex_headless_messenger::Result<BTreeMap<String, String>> {

@@ -11,6 +11,7 @@ pub const DEFAULT_SCOPE_STRINGS: &[&str] = &[
     "spark:rooms_read",
     "spark:memberships_read",
     "spark:people_read",
+    "spark:kms",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

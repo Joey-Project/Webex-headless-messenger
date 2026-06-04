@@ -1,4 +1,7 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Duration,
+};
 
 use tokio::{sync::mpsc, time};
 use url::Url;
@@ -18,6 +21,9 @@ pub struct PollingConfig {
     /// the poller stores the next page URL and resumes it on the next tick.
     pub max_pages_per_poll: usize,
     pub emit_existing_on_first_poll: bool,
+    /// Maximum message IDs retained for in-memory de-duplication. Values below
+    /// 1 are treated as 1, trading duplicate suppression for bounded memory.
+    pub max_seen_ids: usize,
 }
 
 impl Default for PollingConfig {
@@ -27,7 +33,36 @@ impl Default for PollingConfig {
             page_size: 50,
             max_pages_per_poll: 5,
             emit_existing_on_first_poll: false,
+            max_seen_ids: 10_000,
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SeenMessageIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenMessageIds {
+    fn insert(&mut self, id: String, max_ids: usize) -> bool {
+        if self.ids.contains(&id) {
+            return false;
+        }
+
+        self.ids.insert(id.clone());
+        self.order.push_back(id);
+
+        let max_ids = max_ids.max(1);
+        while self.ids.len() > max_ids {
+            if let Some(stale) = self.order.pop_front() {
+                self.ids.remove(&stale);
+            } else {
+                break;
+            }
+        }
+
+        true
     }
 }
 
@@ -37,7 +72,7 @@ pub struct MessagePoller {
     client: WebexClient,
     room_id: String,
     config: PollingConfig,
-    seen: HashSet<String>,
+    seen: SeenMessageIds,
     backlog_next: Option<Url>,
     initialized: bool,
 }
@@ -48,7 +83,7 @@ impl MessagePoller {
             client,
             room_id: room_id.into(),
             config: PollingConfig::default(),
-            seen: HashSet::new(),
+            seen: SeenMessageIds::default(),
             backlog_next: None,
             initialized: false,
         }
@@ -76,7 +111,7 @@ impl MessagePoller {
                 let Some(id) = message.id.clone() else {
                     continue;
                 };
-                let is_new = self.seen.insert(id);
+                let is_new = self.seen.insert(id, self.config.max_seen_ids);
                 saw_known_message |= !is_new;
                 if is_new && (self.initialized || self.config.emit_existing_on_first_poll) {
                     fresh.push(message);
@@ -128,5 +163,25 @@ impl MessagePoller {
             }
         });
         receiver
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeenMessageIds;
+
+    #[test]
+    fn seen_message_ids_are_capacity_bound() {
+        let mut seen = SeenMessageIds::default();
+
+        assert!(seen.insert("a".to_owned(), 2));
+        assert!(seen.insert("b".to_owned(), 2));
+        assert!(seen.insert("c".to_owned(), 2));
+
+        assert_eq!(seen.ids.len(), 2);
+        assert!(!seen.ids.contains("a"));
+        assert!(seen.ids.contains("b"));
+        assert!(seen.ids.contains("c"));
+        assert!(seen.insert("a".to_owned(), 2));
     }
 }

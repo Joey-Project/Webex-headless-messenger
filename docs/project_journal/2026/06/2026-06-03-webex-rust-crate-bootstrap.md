@@ -3,9 +3,9 @@ id: 20260603-webex-rust-bootstrap
 title: Webex Rust Crate Bootstrap
 status: completed
 created: 2026-06-03
-updated: 2026-06-03
-branch:
-pr:
+updated: 2026-06-04
+branch: wip/webex-messaging-crate-pr
+pr: https://github.com/Joey-Project/Webex-headless-messenger/pull/1
 supersedes: []
 superseded_by:
 ---
@@ -23,6 +23,7 @@ superseded_by:
 - `cargo clippy --all-features --all-targets -- -D warnings`、`cargo doc --no-deps --all-features`、project journal validator 已通过。
 - README 已替换模板内容，写明 scope、使用示例和 WebSocket 边界。
 - 内部 reviewer findings 已处理：普通依赖启用 `tokio/rt`、poller 使用 backlog continuation 追分页、token/secret Debug 脱敏、Device Token pending/slow_down 处理、默认与扩展 scope 分离、pagination host 限制。最终 reviewer 复查为 no findings。
+- PR review fix-loop 已处理：默认 OAuth scope 补 `spark:kms`，Authorization Code helper 补 PKCE API，Device Token 错误解析覆盖 Webex `errors[0].description`/`message` 形态，poller 去重缓存加容量上限，smoke token cache 在 Unix 上以 owner-only 权限写入。
 
 ## Next Steps
 - 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。
@@ -32,4 +33,4 @@ superseded_by:
 - Official Webex OpenAPI specs: `https://github.com/webex/webex-openapi-specs`
 - Official Webex OAuth / Device Grant docs: `https://developer.webex.com/create/docs/login-with-webex`
 - Official Webex Webhooks guide: `https://developer.webex.com/docs/api/guides/webhooks`
-- Local validation: `cargo test --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo doc --no-deps --all-features`; `project_journal.py validate --repo /home/codex/Joey-Project/Webex-headless-messenger`
+- Local validation: `cargo fmt --check`; `cargo test --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo doc --no-deps --all-features`; `project_journal.py validate --repo /home/codex/Joey-Project/Webex-headless-messenger`

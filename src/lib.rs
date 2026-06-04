@@ -17,8 +17,8 @@ pub mod webhooks;
 
 pub use auth::{
     AccessTokenProvider, DEFAULT_MESSAGING_SCOPES, DeviceAuthorization, DeviceTokenStatus,
-    MANAGEMENT_SCOPES, MemoryTokenStore, OAuthClient, OAuthConfig, RefreshingTokenProvider,
-    StaticTokenProvider, TokenSet, TokenStore,
+    MANAGEMENT_SCOPES, MemoryTokenStore, OAuthClient, OAuthConfig, PkceCodeChallengeMethod,
+    RefreshingTokenProvider, StaticTokenProvider, TokenSet, TokenStore,
 };
 pub use client::{ClientBuilder, WebexClient};
 pub use error::{ApiError, Error, Result};

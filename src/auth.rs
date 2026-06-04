@@ -193,6 +193,22 @@ pub enum DeviceTokenStatus {
     Authorized(TokenSet),
 }
 
+/// PKCE code challenge method for Authorization Code flow helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkceCodeChallengeMethod {
+    Plain,
+    S256,
+}
+
+impl PkceCodeChallengeMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::S256 => "S256",
+        }
+    }
+}
+
 /// OAuth helper for Webex integrations.
 #[derive(Clone)]
 pub struct OAuthClient {
@@ -221,6 +237,23 @@ impl OAuthClient {
     }
 
     pub fn authorization_url(&self, state: &str) -> Result<Url> {
+        self.build_authorization_url(state, None)
+    }
+
+    pub fn authorization_url_with_pkce(
+        &self,
+        state: &str,
+        code_challenge: &str,
+        code_challenge_method: PkceCodeChallengeMethod,
+    ) -> Result<Url> {
+        self.build_authorization_url(state, Some((code_challenge, code_challenge_method)))
+    }
+
+    fn build_authorization_url(
+        &self,
+        state: &str,
+        pkce: Option<(&str, PkceCodeChallengeMethod)>,
+    ) -> Result<Url> {
         let mut url = self.endpoint("authorize")?;
         let scope = self.config.scope_string();
         {
@@ -232,11 +265,33 @@ impl OAuthClient {
             if let Some(redirect_uri) = &self.config.redirect_uri {
                 query.append_pair("redirect_uri", redirect_uri.as_str());
             }
+            if let Some((code_challenge, code_challenge_method)) = pkce {
+                query.append_pair("code_challenge", code_challenge);
+                query.append_pair("code_challenge_method", code_challenge_method.as_str());
+            }
         }
         Ok(url)
     }
 
     pub async fn exchange_authorization_code(&self, code: &str) -> Result<TokenSet> {
+        let form = self.authorization_code_form(code, None);
+        self.post_token_form("access_token", &form).await
+    }
+
+    pub async fn exchange_authorization_code_with_pkce(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<TokenSet> {
+        let form = self.authorization_code_form(code, Some(code_verifier));
+        self.post_token_form("access_token", &form).await
+    }
+
+    fn authorization_code_form(
+        &self,
+        code: &str,
+        code_verifier: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
             ("client_id", self.config.client_id.clone()),
@@ -248,7 +303,10 @@ impl OAuthClient {
         if let Some(redirect_uri) = &self.config.redirect_uri {
             form.push(("redirect_uri", redirect_uri.to_string()));
         }
-        self.post_token_form("access_token", &form).await
+        if let Some(code_verifier) = code_verifier {
+            form.push(("code_verifier", code_verifier.to_owned()));
+        }
+        form
     }
 
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
@@ -340,12 +398,31 @@ async fn decode_device_token_bad_request(response: reqwest::Response) -> Result<
 }
 
 fn oauth_error_code(value: &Value) -> Option<&str> {
-    value
-        .get("error")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("errorCode").and_then(Value::as_str))
-        .or_else(|| value.get("code").and_then(Value::as_str))
-        .or_else(|| value.pointer("/errors/0/code").and_then(Value::as_str))
+    [
+        value.get("error").and_then(Value::as_str),
+        value.get("errorCode").and_then(Value::as_str),
+        value.get("code").and_then(Value::as_str),
+        value.get("message").and_then(Value::as_str),
+        value.pointer("/errors/0/code").and_then(Value::as_str),
+        value.pointer("/errors/0/message").and_then(Value::as_str),
+        value
+            .pointer("/errors/0/description")
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(normalize_device_oauth_error_code)
+}
+
+fn normalize_device_oauth_error_code(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "authorization_pending" || normalized.contains("authorization_pending") {
+        Some("authorization_pending")
+    } else if normalized == "slow_down" || normalized.contains("slow_down") {
+        Some("slow_down")
+    } else {
+        None
+    }
 }
 
 async fn decode_response<T>(response: reqwest::Response) -> Result<T>
@@ -495,7 +572,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        DEFAULT_MESSAGING_SCOPES, MANAGEMENT_SCOPES, OAuthClient, OAuthConfig, oauth_error_code,
+        DEFAULT_MESSAGING_SCOPES, MANAGEMENT_SCOPES, OAuthClient, OAuthConfig,
+        PkceCodeChallengeMethod, oauth_error_code,
     };
 
     #[test]
@@ -512,6 +590,38 @@ mod tests {
         assert!(query.contains("state=state-1"));
         assert!(query.contains("spark%3Amessages_read"));
         assert!(DEFAULT_MESSAGING_SCOPES.contains(&"spark:messages_write"));
+        assert!(DEFAULT_MESSAGING_SCOPES.contains(&"spark:kms"));
+    }
+
+    #[test]
+    fn builds_authorization_url_with_pkce() {
+        let config = OAuthConfig::new("client-id")
+            .unwrap()
+            .with_redirect_uri(Url::parse("http://localhost:8080/callback").unwrap());
+        let url = OAuthClient::new(config)
+            .authorization_url_with_pkce("state-1", "challenge-1", PkceCodeChallengeMethod::S256)
+            .unwrap();
+        let query = url.query().unwrap();
+        assert!(query.contains("code_challenge=challenge-1"));
+        assert!(query.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn builds_authorization_code_form_with_pkce() {
+        let config = OAuthConfig::new("client-id")
+            .unwrap()
+            .with_client_secret("client-secret")
+            .with_redirect_uri(Url::parse("http://localhost:8080/callback").unwrap());
+        let form = OAuthClient::new(config).authorization_code_form("code-1", Some("verifier-1"));
+
+        assert!(
+            form.iter()
+                .any(|(key, value)| { *key == "code_verifier" && value == "verifier-1" })
+        );
+        assert!(
+            form.iter()
+                .any(|(key, value)| { *key == "client_secret" && value == "client-secret" })
+        );
     }
 
     #[test]
@@ -540,6 +650,14 @@ mod tests {
     #[test]
     fn parses_oauth_error_codes() {
         let value = serde_json::json!({ "error": "slow_down" });
+        assert_eq!(oauth_error_code(&value), Some("slow_down"));
+
+        let value = serde_json::json!({
+            "errors": [{ "description": "authorization_pending" }]
+        });
+        assert_eq!(oauth_error_code(&value), Some("authorization_pending"));
+
+        let value = serde_json::json!({ "message": "slow_down" });
         assert_eq!(oauth_error_code(&value), Some("slow_down"));
     }
 
