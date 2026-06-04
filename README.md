@@ -133,7 +133,7 @@ async fn main() -> webex_headless_messenger::Result<()> {
             }
             DeviceTokenStatus::SlowDown { retry_after } => {
                 interval += Duration::from_secs(5);
-                sleep(retry_after.unwrap_or(interval)).await;
+                sleep(retry_after.unwrap_or(Duration::ZERO).max(interval)).await;
             }
         }
     }
