@@ -125,8 +125,11 @@ async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Res
         match oauth.poll_device_token(&auth.device_code).await? {
             DeviceTokenStatus::Authorized(token) => {
                 let serialized = serde_json::to_string_pretty(&token)?;
-                write_token_cache(&token_path, &serialized)?;
-                println!("token_cache=stored");
+                if write_token_cache(&token_path, &serialized)? {
+                    println!("token_cache=stored");
+                } else {
+                    println!("token_cache=disabled platform=non_unix");
+                }
                 return Ok(token);
             }
             DeviceTokenStatus::Pending { retry_after } => {
@@ -259,16 +262,12 @@ fn read_token_cache(path: &Path) -> webex_headless_messenger::Result<Option<Stri
 }
 
 #[cfg(not(unix))]
-fn read_token_cache(path: &Path) -> webex_headless_messenger::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+fn read_token_cache(_path: &Path) -> webex_headless_messenger::Result<Option<String>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
-fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<()> {
+fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         harden_owned_directory(parent)?;
@@ -296,7 +295,7 @@ fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::R
     std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&temp_path, path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -345,12 +344,8 @@ fn effective_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn write_token_cache(path: &Path, contents: &str) -> webex_headless_messenger::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, contents)?;
-    Ok(())
+fn write_token_cache(_path: &Path, _contents: &str) -> webex_headless_messenger::Result<bool> {
+    Ok(false)
 }
 
 fn read_env(path: &str) -> webex_headless_messenger::Result<BTreeMap<String, String>> {

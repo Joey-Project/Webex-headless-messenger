@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::{
     client::WebexClient,
-    error::Result,
+    error::{Error, Result},
     types::{ListMessage, ListMessages},
 };
 
@@ -25,6 +25,9 @@ pub struct PollingConfig {
     /// Maximum message IDs retained for in-memory de-duplication. Values below
     /// 1 are treated as 1, trading duplicate suppression for bounded memory.
     pub max_seen_ids: usize,
+    /// Maximum messages or pending message IDs buffered while preserving
+    /// chronological catch-up order across multiple poll ticks.
+    pub max_pending_messages: usize,
 }
 
 impl Default for PollingConfig {
@@ -35,6 +38,7 @@ impl Default for PollingConfig {
             max_pages_per_poll: 5,
             emit_existing_on_first_poll: false,
             max_seen_ids: 10_000,
+            max_pending_messages: 10_000,
         }
     }
 }
@@ -116,6 +120,21 @@ fn effective_poll_interval(interval: Duration) -> Duration {
     interval.max(Duration::from_millis(1))
 }
 
+fn ensure_pending_within_limit(
+    pending_messages: usize,
+    pending_ids: usize,
+    max_pending_messages: usize,
+) -> Result<()> {
+    let limit = max_pending_messages.max(1);
+    if pending_messages > limit || pending_ids > limit {
+        Err(Error::Other(format!(
+            "message poller backlog exceeded max_pending_messages={limit}; increase PollingConfig::max_pending_messages or poll more frequently"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Simple room message poller with in-memory de-duplication.
 #[derive(Clone)]
 pub struct MessagePoller {
@@ -180,6 +199,11 @@ impl MessagePoller {
             );
             fresh.append(&mut page_fresh);
             new_ids.append(&mut page_ids);
+            ensure_pending_within_limit(
+                fresh.len(),
+                new_ids.len(),
+                self.config.max_pending_messages,
+            )?;
 
             if saw_known_message && self.initialized {
                 self.backlog_next = None;
@@ -259,7 +283,7 @@ mod tests {
 
     use super::{
         SeenMessageIds, collect_page_messages, effective_poll_interval,
-        preserve_pending_on_page_error,
+        ensure_pending_within_limit, preserve_pending_on_page_error,
     };
 
     #[test]
@@ -379,6 +403,13 @@ mod tests {
             effective_poll_interval(Duration::from_secs(1)),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn pending_backlog_limit_is_enforced() {
+        assert!(ensure_pending_within_limit(2, 2, 2).is_ok());
+        assert!(ensure_pending_within_limit(3, 2, 2).is_err());
+        assert!(ensure_pending_within_limit(2, 3, 2).is_err());
     }
 
     fn message(id: &str) -> Message {

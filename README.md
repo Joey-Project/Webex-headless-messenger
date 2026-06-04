@@ -188,8 +188,8 @@ cargo run --example smoke --all-features
 ```
 
 The example starts Device Grant Flow, stores the resulting token in
-`.codex-tmp/webex-smoke/token.json` with owner-only file permissions on Unix,
-resolves the test room from
+`.codex-tmp/webex-smoke/token.json` with owner-only file permissions on Unix
+and disables persistent token caching on non-Unix platforms, resolves the test room from
 `WEBEX_TEST_ROOM_ID`, candidates parsed from `WEBEX_TEST_ROOM_LINK`, or a unique
 `WEBEX_TEST_ROOM_TITLE`, then performs read/send/reply smoke checks.
 

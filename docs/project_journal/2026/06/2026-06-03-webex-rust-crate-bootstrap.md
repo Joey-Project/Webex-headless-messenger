@@ -30,6 +30,7 @@ superseded_by:
 - 第五轮 review fix-loop 已处理：默认首轮 skip-existing baseline 建立期间如果后续分页失败，poller 保持未初始化并从头重试 baseline，避免下一轮把历史消息当 fresh 发出。
 - 第六轮 review fix-loop 已处理：REST pagination `next` URL 校验扩展到 configured base path 前缀，避免 path-based proxy 场景把 bearer token 发到同 host 的非 Webex 路径。
 - 第七轮 GitHub Codex review fix-loop 已处理：pagination path 前缀改为 segment-boundary 校验，Authorization Code token exchange 缺 client secret 时本地早失败，poller `spawn` 对 zero interval 做最小值保护。
+- 第八轮 review fix-loop 已处理：非 Unix smoke 示例禁用持久 token cache 以避免不安全 ACL/reparse point 行为，poller 增加 `max_pending_messages` 上限避免跨 tick backlog 无界缓存。
 
 ## Next Steps
 - 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。
