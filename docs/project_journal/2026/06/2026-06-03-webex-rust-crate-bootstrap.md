@@ -1,0 +1,35 @@
+---
+id: 20260603-webex-rust-bootstrap
+title: Webex Rust Crate Bootstrap
+status: completed
+created: 2026-06-03
+updated: 2026-06-03
+branch:
+pr:
+supersedes: []
+superseded_by:
+---
+
+# Webex Rust Crate Bootstrap
+
+## Summary
+- 初始化 `webex-headless-messenger` Rust crate，用于 Generic Account 通过 Webex OAuth Integration 访问 Messaging REST API。
+- 第一阶段聚焦稳定公开 surface：OAuth、REST typed client、pagination、webhook 类型与签名验证、无公网 ingress 场景下的 polling receiver。
+- WebSocket/Mercury 不在第一阶段直接复刻；官方资料显示 realtime listen 主要通过 Webex JS SDK 暴露，Rust crate 先保留 experimental marker。
+
+## Current State
+- Rust toolchain 已安装到用户级 `~/.cargo`，并通过 `~/.zshenv` 加入 PATH。
+- `cargo test --all-features` 已通过，覆盖分页 Link、Retry-After、OAuth authorization URL、path encoding、请求序列化、Debug 脱敏、webhook 签名。
+- `cargo clippy --all-features --all-targets -- -D warnings`、`cargo doc --no-deps --all-features`、project journal validator 已通过。
+- README 已替换模板内容，写明 scope、使用示例和 WebSocket 边界。
+- 内部 reviewer findings 已处理：普通依赖启用 `tokio/rt`、poller 使用 backlog continuation 追分页、token/secret Debug 脱敏、Device Token pending/slow_down 处理、默认与扩展 scope 分离、pagination host 限制。最终 reviewer 复查为 no findings。
+
+## Next Steps
+- 如果后续要接真实账号，新增不含 secret 的 examples 或 smoke docs，避免提交 token。
+- 若需要 realtime 低延迟，优先设计 JS SDK sidecar 事件转发协议，而不是直接实现 Mercury 私有连接。
+
+## Evidence
+- Official Webex OpenAPI specs: `https://github.com/webex/webex-openapi-specs`
+- Official Webex OAuth / Device Grant docs: `https://developer.webex.com/create/docs/login-with-webex`
+- Official Webex Webhooks guide: `https://developer.webex.com/docs/api/guides/webhooks`
+- Local validation: `cargo test --all-features`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo doc --no-deps --all-features`; `project_journal.py validate --repo /home/codex/Joey-Project/Webex-headless-messenger`
