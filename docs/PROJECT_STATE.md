@@ -5,7 +5,7 @@
 - 首个 crate bootstrap slice 已完成；后续真实账号 smoke、文件上传、cards、realtime sidecar 评估见 TODO。
 
 ## Recovery Pointers
-- Latest completed workstream: `docs/project_journal/2026/06/2026-06-03-webex-rust-crate-bootstrap.md`
+- Latest completed workstream: `docs/project_journal/2026/06/2026-06-05-webex-smoke-docs.md`
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers

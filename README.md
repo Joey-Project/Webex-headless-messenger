@@ -193,6 +193,9 @@ and disables persistent token caching on non-Unix platforms, resolves the test r
 `WEBEX_TEST_ROOM_ID`, candidates parsed from `WEBEX_TEST_ROOM_LINK`, or a unique
 `WEBEX_TEST_ROOM_TITLE`, then performs read/send/reply smoke checks.
 
+See [docs/smoke-testing.md](docs/smoke-testing.md) for Webex Integration setup,
+Device Grant authorization steps, expected output, and troubleshooting.
+
 ## References
 
 - Webex Messaging REST API: <https://developer.webex.com/docs/api/v1/messages>

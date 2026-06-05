@@ -1,4 +1,5 @@
 # Project TODO
 
-- [pending] 在拿到真实 Webex Integration 和 generic account 后，补一组可手动运行的 OAuth/device-flow smoke instructions。
-- [pending] 后续 slice 评估文件上传、Adaptive Card builder、JS SDK sidecar realtime bridge 是否需要进入 crate。
+- [pending] 后续 slice 实现简单的本地文件上传 multipart helper。
+- [pending] 后续 slice 评估 JS SDK sidecar realtime bridge。
+- [deferred] Adaptive Card 暂保留 raw JSON attachment payload，不做复杂 builder/DSL；有实际卡片需求后再评估。
