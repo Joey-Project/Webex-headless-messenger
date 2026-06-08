@@ -27,9 +27,10 @@ Redirect URI(s)
 https://oauth-helper-a.wbx2.com/helperservice/v1/actions/device/callback
 https://oauth-helper-r.wbx2.com/helperservice/v1/actions/device/callback
 https://oauth-helper-k.wbx2.com/helperservice/v1/actions/device/callback
+https://oauth-helper-d.wbx2.com/helperservice/v1/actions/device/callback
 ```
 
-The OAuth helper redirect URIs are required for Webex Device Grant Flow. They
+The four OAuth helper redirect URIs are required for Webex Device Grant Flow. They
 are hosted by Webex and are only used for the OAuth bootstrap.
 
 Start with the Messaging scopes used by `DEFAULT_MESSAGING_SCOPES`:
@@ -151,7 +152,5 @@ rm .codex-tmp/webex-smoke/token.json
 
 - Webex Login with Webex and Device Grant Flow:
   <https://developer.webex.com/docs/login-with-webex>
-- Webex Device Grant Flow helper redirect URI example:
-  <https://developer.webex.com/blog/device-grant-flow-you-got-it>
 - Webex Messaging REST API:
   <https://developer.webex.com/docs/api/v1/messages>

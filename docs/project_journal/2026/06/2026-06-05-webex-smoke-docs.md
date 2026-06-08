@@ -17,6 +17,8 @@ superseded_by:
 - Documented Webex Integration setup, Device Grant helper redirect URIs, minimal
   Messaging scopes, `.env.webex-test`, room resolution, expected smoke output,
   token cache handling, and troubleshooting.
+- Synced the Device Grant redirect URI list with the current Webex Login docs,
+  including `oauth-helper-d`.
 - Linked the guide from README while keeping README as a concise crate overview.
 
 ## Current State
@@ -31,5 +33,3 @@ superseded_by:
 ## Evidence
 - Official Webex Login with Webex / Device Grant docs:
   `https://developer.webex.com/docs/login-with-webex`
-- Webex Device Grant helper redirect URI example:
-  `https://developer.webex.com/blog/device-grant-flow-you-got-it`
