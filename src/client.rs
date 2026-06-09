@@ -6,6 +6,7 @@ use reqwest::{
     multipart::{Form, Part},
 };
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 use url::Url;
 
 use crate::{
@@ -396,7 +397,15 @@ async fn message_multipart_form(
             Error::Other("local file attachment requires a UTF-8 file name".to_owned())
         })?;
 
-    let metadata = tokio::fs::metadata(file.path()).await?;
+    let preflight_metadata = tokio::fs::metadata(file.path()).await?;
+    if !preflight_metadata.is_file() {
+        return Err(Error::Other(
+            "local file attachment path must be a regular file".to_owned(),
+        ));
+    }
+
+    let opened = tokio::fs::File::open(file.path()).await?;
+    let metadata = opened.metadata().await?;
     if !metadata.is_file() {
         return Err(Error::Other(
             "local file attachment path must be a regular file".to_owned(),
@@ -409,7 +418,17 @@ async fn message_multipart_form(
         )));
     }
 
-    let bytes = tokio::fs::read(file.path()).await?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_LOCAL_FILE_UPLOAD_BYTES) as usize);
+    opened
+        .take(MAX_LOCAL_FILE_UPLOAD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_LOCAL_FILE_UPLOAD_BYTES {
+        return Err(Error::Other(format!(
+            "local file attachment exceeds Webex 100 MiB limit: {} bytes read",
+            bytes.len()
+        )));
+    }
     let mut part = Part::bytes(bytes).file_name(file_name);
     part = part.mime_str(file.media_type().unwrap_or("application/octet-stream"))?;
     Ok(form.part("files", part))
