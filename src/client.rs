@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{
@@ -6,6 +6,8 @@ use reqwest::{
     multipart::{Form, Part},
 };
 use serde::Serialize;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
@@ -397,14 +399,7 @@ async fn message_multipart_form(
             Error::Other("local file attachment requires a UTF-8 file name".to_owned())
         })?;
 
-    let preflight_metadata = tokio::fs::metadata(file.path()).await?;
-    if !preflight_metadata.is_file() {
-        return Err(Error::Other(
-            "local file attachment path must be a regular file".to_owned(),
-        ));
-    }
-
-    let opened = tokio::fs::File::open(file.path()).await?;
+    let opened = open_local_attachment(file.path()).await?;
     let metadata = opened.metadata().await?;
     if !metadata.is_file() {
         return Err(Error::Other(
@@ -432,6 +427,37 @@ async fn message_multipart_form(
     let mut part = Part::bytes(bytes).file_name(file_name);
     part = part.mime_str(file.media_type().unwrap_or("application/octet-stream"))?;
     Ok(form.part("files", part))
+}
+
+async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            options.open(path)
+        })
+        .await
+        .map_err(|error| {
+            Error::Other(format!("local file attachment open task failed: {error}"))
+        })??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = tokio::fs::metadata(path).await?;
+        if !metadata.is_file() {
+            return Err(Error::Other(
+                "local file attachment path must be a regular file".to_owned(),
+            ));
+        }
+
+        Ok(tokio::fs::File::open(path).await?)
+    }
 }
 
 fn append_optional_text(mut form: Form, name: &'static str, value: &Option<String>) -> Form {
@@ -625,6 +651,34 @@ mod tests {
         assert!(error.to_string().contains("path must be a regular file"));
 
         let _ = std::fs::remove_dir(directory);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_message_with_file_rejects_fifo_without_blocking() {
+        let fifo_path =
+            std::env::temp_dir().join(format!("webex-headless-upload-{}-fifo", std::process::id()));
+        let output = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&fifo_path).with_file_name("fifo"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("path must be a regular file"));
+
+        let _ = std::fs::remove_file(fifo_path);
     }
 
     #[test]
