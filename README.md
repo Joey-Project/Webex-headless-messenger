@@ -24,12 +24,12 @@ Implemented in the first slice:
 - RFC5988 `Link` header pagination.
 - Structured API errors with `trackingId` and `Retry-After` when available.
 - Polling-based message receiver for deployments without public HTTP ingress.
+- Local file upload helper for `multipart/form-data` message creation.
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
   feature.
 
 Not implemented yet:
 
-- Local file upload multipart helpers.
 - Adaptive Card builders beyond raw JSON attachment payloads.
 - A native Rust WebSocket/Mercury client. Cisco documents realtime messaging
   listening through the official JavaScript SDK, not as a stable public
@@ -145,6 +145,33 @@ async fn main() -> webex_headless_messenger::Result<()> {
 Store the resulting refresh token in your application-owned secret storage. The
 crate includes `MemoryTokenStore` for tests and simple processes; production
 headless deployments should provide a durable `TokenStore`.
+
+## Local File Upload
+
+```rust
+use webex_headless_messenger::{
+    types::{CreateMessage, LocalFileAttachment},
+    WebexClient,
+};
+
+#[tokio::main]
+async fn main() -> webex_headless_messenger::Result<()> {
+    let client = WebexClient::from_access_token(std::env::var("WEBEX_ACCESS_TOKEN").unwrap())?;
+
+    client
+        .create_message_with_file(
+            &CreateMessage::text(std::env::var("WEBEX_ROOM_ID").unwrap(), "attached report"),
+            &LocalFileAttachment::new("./report.pdf").with_media_type("application/pdf"),
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+Local filesystem uploads use `multipart/form-data` and support one local file per
+message. Webex validates attachment size and media type server-side. Publicly
+reachable file URLs still use the JSON `files` field with `create_message`.
 
 ## Polling Without Public Ingress
 

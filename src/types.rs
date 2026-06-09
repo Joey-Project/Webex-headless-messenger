@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -235,6 +238,58 @@ impl CreateMessage {
     }
 }
 
+/// Local filesystem attachment uploaded with a multipart message request.
+///
+/// Webex validates attachment size and media type server-side.
+#[derive(Clone)]
+pub struct LocalFileAttachment {
+    path: PathBuf,
+    file_name: Option<String>,
+    media_type: Option<String>,
+}
+
+impl LocalFileAttachment {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            file_name: None,
+            media_type: None,
+        }
+    }
+
+    pub fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
+        self.file_name = Some(file_name.into());
+        self
+    }
+
+    pub fn with_media_type(mut self, media_type: impl Into<String>) -> Self {
+        self.media_type = Some(media_type.into());
+        self
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+}
+
+impl fmt::Debug for LocalFileAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalFileAttachment")
+            .field("path", &self.path)
+            .field("file_name", &self.file_name)
+            .field("media_type", &self.media_type)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateMessage {
@@ -426,7 +481,7 @@ impl fmt::Debug for UpdateWebhook {
 mod tests {
     use serde_json::json;
 
-    use super::{CreateMessage, CreateWebhook, UpdateMembership};
+    use super::{CreateMessage, CreateWebhook, LocalFileAttachment, UpdateMembership};
 
     #[test]
     fn serializes_reply_message_body() {
@@ -454,6 +509,16 @@ mod tests {
                 "text": "hi"
             })
         );
+    }
+
+    #[test]
+    fn local_file_attachment_keeps_path_and_metadata() {
+        let upload = LocalFileAttachment::new("/tmp/report.txt")
+            .with_file_name("report.txt")
+            .with_media_type("text/plain");
+        assert_eq!(upload.path(), std::path::Path::new("/tmp/report.txt"));
+        assert_eq!(upload.file_name(), Some("report.txt"));
+        assert_eq!(upload.media_type(), Some("text/plain"));
     }
 
     #[test]
