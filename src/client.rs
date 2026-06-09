@@ -9,7 +9,7 @@ use serde::Serialize;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
@@ -26,9 +26,16 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://webexapis.com/v1/";
+const DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE: &str = "application/octet-stream";
 const MAX_LOCAL_FILE_UPLOAD_BYTES: u64 = 100_000_000;
 #[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
 /// Builder for [`WebexClient`].
 #[derive(Clone)]
@@ -403,6 +410,10 @@ async fn message_multipart_form(
             Error::Other("local file attachment requires a UTF-8 file name".to_owned())
         })?;
     let file_name = reject_unsafe_local_file_name(file_name)?;
+    let media_type = file
+        .media_type()
+        .unwrap_or(DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE);
+    validate_local_attachment_media_type(media_type)?;
 
     let opened = open_local_attachment(file.path()).await?;
     let metadata = opened.metadata().await?;
@@ -421,8 +432,19 @@ async fn message_multipart_form(
     let bytes =
         read_limited_local_attachment(opened, metadata.len(), MAX_LOCAL_FILE_UPLOAD_BYTES).await?;
     let mut part = Part::bytes(bytes).file_name(file_name);
-    part = part.mime_str(file.media_type().unwrap_or("application/octet-stream"))?;
+    part = part.mime_str(media_type)?;
     Ok(form.part("files", part))
+}
+
+fn validate_local_attachment_media_type(media_type: &str) -> Result<()> {
+    Part::bytes(Vec::new())
+        .mime_str(media_type)
+        .map_err(|error| {
+            Error::Other(format!(
+                "local file attachment media type is invalid: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 fn reject_unsafe_local_file_name(file_name: String) -> Result<String> {
@@ -481,10 +503,11 @@ async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
             let mut options = std::fs::OpenOptions::new();
             options
                 .read(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .security_qos_flags(SECURITY_IDENTIFICATION);
             let file = options.open(path)?;
             let metadata = file.metadata()?;
-            if metadata.file_type().is_symlink() {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "local file attachment path must be a regular file",
@@ -570,8 +593,9 @@ mod tests {
     use crate::types::{CreateMessage, LocalFileAttachment};
 
     use super::{
-        MAX_LOCAL_FILE_UPLOAD_BYTES, WebexClient, encode_segment, ensure_directory_url,
-        is_same_or_child_path, open_local_attachment, read_limited_local_attachment,
+        DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE, MAX_LOCAL_FILE_UPLOAD_BYTES, WebexClient,
+        encode_segment, ensure_directory_url, is_same_or_child_path, open_local_attachment,
+        read_limited_local_attachment, validate_local_attachment_media_type,
     };
 
     #[tokio::test]
@@ -643,6 +667,30 @@ mod tests {
         assert!(error.to_string().contains("must not contain CR or LF"));
 
         let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_invalid_media_type_before_opening_file() {
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new("/definitely/missing.bin")
+                    .with_file_name("missing.bin")
+                    .with_media_type("bad media type"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("media type is invalid"));
+    }
+
+    #[test]
+    fn validate_local_attachment_media_type_accepts_default() {
+        validate_local_attachment_media_type(DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE).unwrap();
     }
 
     #[tokio::test]
