@@ -839,13 +839,16 @@ mod tests {
             .access_token("token")
             .build()
             .unwrap();
-        let error = client
-            .create_message_with_file(
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.create_message_with_file(
                 &CreateMessage::text("room-1", "attached"),
                 &LocalFileAttachment::new(&fifo_path).with_file_name("fifo"),
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("FIFO upload rejection should not block")
+        .unwrap_err();
         assert!(error.to_string().contains("path must be a regular file"));
 
         let _ = std::fs::remove_file(fifo_path);
