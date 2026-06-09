@@ -8,7 +8,7 @@ use reqwest::{
 use serde::Serialize;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://webexapis.com/v1/";
-const MAX_LOCAL_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_LOCAL_FILE_UPLOAD_BYTES: u64 = 100_000_000;
 
 /// Builder for [`WebexClient`].
 #[derive(Clone)]
@@ -398,6 +398,7 @@ async fn message_multipart_form(
         .ok_or_else(|| {
             Error::Other("local file attachment requires a UTF-8 file name".to_owned())
         })?;
+    let file_name = reject_unsafe_local_file_name(file_name)?;
 
     let opened = open_local_attachment(file.path()).await?;
     let metadata = opened.metadata().await?;
@@ -408,25 +409,47 @@ async fn message_multipart_form(
     }
     if metadata.len() > MAX_LOCAL_FILE_UPLOAD_BYTES {
         return Err(Error::Other(format!(
-            "local file attachment exceeds Webex 100 MiB limit: {} bytes",
+            "local file attachment exceeds Webex 100 MB limit: {} bytes",
             metadata.len()
         )));
     }
 
-    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_LOCAL_FILE_UPLOAD_BYTES) as usize);
-    opened
-        .take(MAX_LOCAL_FILE_UPLOAD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() as u64 > MAX_LOCAL_FILE_UPLOAD_BYTES {
-        return Err(Error::Other(format!(
-            "local file attachment exceeds Webex 100 MiB limit: {} bytes read",
-            bytes.len()
-        )));
-    }
+    let bytes =
+        read_limited_local_attachment(opened, metadata.len(), MAX_LOCAL_FILE_UPLOAD_BYTES).await?;
     let mut part = Part::bytes(bytes).file_name(file_name);
     part = part.mime_str(file.media_type().unwrap_or("application/octet-stream"))?;
     Ok(form.part("files", part))
+}
+
+fn reject_unsafe_local_file_name(file_name: String) -> Result<String> {
+    if file_name.contains('\r') || file_name.contains('\n') {
+        return Err(Error::Other(
+            "local file attachment file name must not contain CR or LF".to_owned(),
+        ));
+    }
+
+    Ok(file_name)
+}
+
+async fn read_limited_local_attachment<R>(
+    reader: R,
+    metadata_len: u64,
+    max_bytes: u64,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(metadata_len.min(max_bytes) as usize);
+    let mut limited = reader.take(max_bytes + 1);
+    limited.read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::Other(format!(
+            "local file attachment exceeds Webex 100 MB limit: {} bytes read",
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes)
 }
 
 async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
@@ -449,13 +472,6 @@ async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
 
     #[cfg(not(unix))]
     {
-        let metadata = tokio::fs::metadata(path).await?;
-        if !metadata.is_file() {
-            return Err(Error::Other(
-                "local file attachment path must be a regular file".to_owned(),
-            ));
-        }
-
         Ok(tokio::fs::File::open(path).await?)
     }
 }
@@ -526,7 +542,7 @@ mod tests {
 
     use super::{
         MAX_LOCAL_FILE_UPLOAD_BYTES, WebexClient, encode_segment, ensure_directory_url,
-        is_same_or_child_path,
+        is_same_or_child_path, open_local_attachment, read_limited_local_attachment,
     };
 
     #[tokio::test]
@@ -571,6 +587,31 @@ mod tests {
         assert!(request.contains("name=\"files\"; filename=\"note.txt\""));
         assert!(lower.contains("content-type: text/plain"));
         assert!(request.contains("file-body"));
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_control_characters_in_file_name() {
+        let file_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-unsafe-name.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "file-body").unwrap();
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&file_path).with_file_name("bad\r\nname.txt"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must not contain CR or LF"));
 
         let _ = std::fs::remove_file(file_path);
     }
@@ -623,7 +664,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("exceeds Webex 100 MiB limit"));
+        assert!(error.to_string().contains("exceeds Webex 100 MB limit"));
 
         let _ = std::fs::remove_file(file_path);
     }
@@ -651,6 +692,38 @@ mod tests {
         assert!(error.to_string().contains("path must be a regular file"));
 
         let _ = std::fs::remove_dir(directory);
+    }
+
+    #[tokio::test]
+    async fn read_limited_local_attachment_rejects_reader_over_limit() {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_limited_local_attachment(tokio::io::repeat(1), 0, 8),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("9 bytes read"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_local_attachment_rejects_symbolic_links() {
+        let target_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-target.txt",
+            std::process::id()
+        ));
+        let link_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-link.txt",
+            std::process::id()
+        ));
+        std::fs::write(&target_path, "file-body").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        assert!(open_local_attachment(&link_path).await.is_err());
+
+        let _ = std::fs::remove_file(link_path);
+        let _ = std::fs::remove_file(target_path);
     }
 
     #[cfg(unix)]

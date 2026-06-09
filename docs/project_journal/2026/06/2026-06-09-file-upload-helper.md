@@ -16,7 +16,7 @@ superseded_by:
 - Added `LocalFileAttachment` and `WebexClient::create_message_with_file` for one
   local filesystem attachment via `multipart/form-data` on `POST /v1/messages`.
 - Kept public file URL support on the existing JSON `CreateMessage.files` path.
-- Added local regular-file and 100 MiB size guards before reading attachment
+- Added local regular-file and 100 MB size guards before reading attachment
   bytes into the request body.
 - Documented the minimal file upload path in README.
 
