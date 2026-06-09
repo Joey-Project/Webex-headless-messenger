@@ -170,8 +170,11 @@ async fn main() -> webex_headless_messenger::Result<()> {
 ```
 
 Local filesystem uploads use `multipart/form-data` and support one local file per
-message. Webex validates attachment size and media type server-side. Publicly
-reachable file URLs still use the JSON `files` field with `create_message`.
+message. The helper rejects non-regular files, files over 100 MB, CR/LF in file
+names, and invalid MIME syntax before sending the request; Webex may still apply
+additional server-side validation. On Unix and Windows, local symlinks/reparse
+points are opened with no-follow semantics and then rejected. Publicly reachable
+file URLs still use the JSON `files` field with `create_message`.
 
 ## Polling Without Public Ingress
 

@@ -240,7 +240,10 @@ impl CreateMessage {
 
 /// Local filesystem attachment uploaded with a multipart message request.
 ///
-/// Webex validates attachment size and media type server-side.
+/// The message helper performs local preflight validation before sending the
+/// request: it rejects non-regular files, files over the Webex 100 MB limit,
+/// CR/LF in multipart file names, and invalid MIME syntax. Webex may still
+/// apply additional server-side validation.
 #[derive(Clone)]
 pub struct LocalFileAttachment {
     path: PathBuf,

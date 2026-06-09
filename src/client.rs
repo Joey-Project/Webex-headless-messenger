@@ -7,7 +7,9 @@ use reqwest::{
 };
 use serde::Serialize;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
@@ -25,6 +27,8 @@ use crate::{
 
 const DEFAULT_BASE_URL: &str = "https://webexapis.com/v1/";
 const MAX_LOCAL_FILE_UPLOAD_BYTES: u64 = 100_000_000;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Builder for [`WebexClient`].
 #[derive(Clone)]
@@ -470,7 +474,32 @@ async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
         Ok(tokio::fs::File::from_std(file))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(path)?;
+            let metadata = file.metadata()?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "local file attachment path must be a regular file",
+                ));
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|error| {
+            Error::Other(format!("local file attachment open task failed: {error}"))
+        })??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(tokio::fs::File::open(path).await?)
     }
@@ -723,6 +752,30 @@ mod tests {
         assert!(open_local_attachment(&link_path).await.is_err());
 
         let _ = std::fs::remove_file(link_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn open_local_attachment_rejects_windows_symbolic_links() {
+        let target_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-target.txt",
+            std::process::id()
+        ));
+        let link_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-link.txt",
+            std::process::id()
+        ));
+        std::fs::write(&target_path, "file-body").unwrap();
+        match std::os::windows::fs::symlink_file(&target_path, &link_path) {
+            Ok(()) => {
+                assert!(open_local_attachment(&link_path).await.is_err());
+                let _ = std::fs::remove_file(link_path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
+
         let _ = std::fs::remove_file(target_path);
     }
 
