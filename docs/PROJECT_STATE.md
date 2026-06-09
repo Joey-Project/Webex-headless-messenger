@@ -2,10 +2,10 @@
 
 ## Current State
 - 仓库已从 review-gate 模板切换为 `webex-headless-messenger` Rust library crate。
-- 首个 crate bootstrap slice 已完成；后续真实账号 smoke、文件上传、cards、realtime sidecar 评估见 TODO。
+- 首个 crate bootstrap slice 已完成；smoke docs 和简单文件上传 helper 已完成；cards 与 realtime sidecar 仍按需评估。
 
 ## Recovery Pointers
-- Latest completed workstream: `docs/project_journal/2026/06/2026-06-05-webex-smoke-docs.md`
+- Latest completed workstream: `docs/project_journal/2026/06/2026-06-09-file-upload-helper.md`
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers

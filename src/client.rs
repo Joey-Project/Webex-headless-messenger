@@ -1,8 +1,16 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::Method;
+use reqwest::{
+    Method,
+    multipart::{Form, Part},
+};
 use serde::Serialize;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
 use crate::{
@@ -12,12 +20,22 @@ use crate::{
     types::{
         CreateMembership, CreateMessage, CreateRoom, CreateWebhook, DirectMessage,
         ListDirectMessages, ListMemberships, ListMessage, ListMessages, ListRooms, ListWebhooks,
-        Membership, Message, Person, Room, UpdateMembership, UpdateMessage, UpdateRoom,
-        UpdateWebhook, Webhook,
+        LocalFileAttachment, Membership, Message, Person, Room, UpdateMembership, UpdateMessage,
+        UpdateRoom, UpdateWebhook, Webhook,
     },
 };
 
 const DEFAULT_BASE_URL: &str = "https://webexapis.com/v1/";
+const DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE: &str = "application/octet-stream";
+const MAX_LOCAL_FILE_UPLOAD_BYTES: u64 = 100_000_000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
 /// Builder for [`WebexClient`].
 #[derive(Clone)]
@@ -137,6 +155,22 @@ impl WebexClient {
 
     pub async fn create_message(&self, request: &CreateMessage) -> Result<Message> {
         self.send_json(Method::POST, "messages", request).await
+    }
+
+    /// Create a message with one local filesystem attachment.
+    pub async fn create_message_with_file(
+        &self,
+        request: &CreateMessage,
+        file: &LocalFileAttachment,
+    ) -> Result<Message> {
+        let form = message_multipart_form(request, file).await?;
+        let response = self
+            .authenticated(Method::POST, self.endpoint("messages")?)
+            .await?
+            .multipart(form)
+            .send()
+            .await?;
+        decode_json(response).await
     }
 
     pub async fn reply_text(
@@ -337,6 +371,170 @@ impl WebexClient {
     }
 }
 
+async fn message_multipart_form(
+    request: &CreateMessage,
+    file: &LocalFileAttachment,
+) -> Result<Form> {
+    if !request.files.is_empty() {
+        return Err(Error::Other(
+            "create_message_with_file accepts one local file attachment; use create_message for public file URLs"
+                .to_owned(),
+        ));
+    }
+    if !request.attachments.is_empty() {
+        return Err(Error::Other(
+            "create_message_with_file does not support Adaptive Card attachments; use raw JSON create_message for card payloads"
+                .to_owned(),
+        ));
+    }
+
+    let mut form = Form::new();
+    form = append_optional_text(form, "roomId", &request.room_id);
+    form = append_optional_text(form, "parentId", &request.parent_id);
+    form = append_optional_text(form, "toPersonId", &request.to_person_id);
+    form = append_optional_text(form, "toPersonEmail", &request.to_person_email);
+    form = append_optional_text(form, "text", &request.text);
+    form = append_optional_text(form, "markdown", &request.markdown);
+
+    let file_name = file
+        .file_name()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            file.path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            Error::Other("local file attachment requires a UTF-8 file name".to_owned())
+        })?;
+    let file_name = reject_unsafe_local_file_name(file_name)?;
+    let media_type = file
+        .media_type()
+        .unwrap_or(DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE);
+    validate_local_attachment_media_type(media_type)?;
+
+    let opened = open_local_attachment(file.path()).await?;
+    let metadata = opened.metadata().await?;
+    if !metadata.is_file() {
+        return Err(Error::Other(
+            "local file attachment path must be a regular file".to_owned(),
+        ));
+    }
+    if metadata.len() > MAX_LOCAL_FILE_UPLOAD_BYTES {
+        return Err(Error::Other(format!(
+            "local file attachment exceeds Webex 100 MB limit: {} bytes",
+            metadata.len()
+        )));
+    }
+
+    let bytes =
+        read_limited_local_attachment(opened, metadata.len(), MAX_LOCAL_FILE_UPLOAD_BYTES).await?;
+    let mut part = Part::bytes(bytes).file_name(file_name);
+    part = part.mime_str(media_type)?;
+    Ok(form.part("files", part))
+}
+
+fn validate_local_attachment_media_type(media_type: &str) -> Result<()> {
+    Part::bytes(Vec::new())
+        .mime_str(media_type)
+        .map_err(|error| {
+            Error::Other(format!(
+                "local file attachment media type is invalid: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn reject_unsafe_local_file_name(file_name: String) -> Result<String> {
+    if file_name.contains('\r') || file_name.contains('\n') {
+        return Err(Error::Other(
+            "local file attachment file name must not contain CR or LF".to_owned(),
+        ));
+    }
+
+    Ok(file_name)
+}
+
+async fn read_limited_local_attachment<R>(
+    reader: R,
+    metadata_len: u64,
+    max_bytes: u64,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(metadata_len.min(max_bytes) as usize);
+    let mut limited = reader.take(max_bytes + 1);
+    limited.read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Error::Other(format!(
+            "local file attachment exceeds Webex 100 MB limit: {} bytes read",
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes)
+}
+
+async fn open_local_attachment(path: &Path) -> Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            options.open(path)
+        })
+        .await
+        .map_err(|error| {
+            Error::Other(format!("local file attachment open task failed: {error}"))
+        })??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    #[cfg(windows)]
+    {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .security_qos_flags(SECURITY_IDENTIFICATION);
+            let file = options.open(path)?;
+            let metadata = file.metadata()?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "local file attachment path must be a regular file",
+                ));
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|error| {
+            Error::Other(format!("local file attachment open task failed: {error}"))
+        })??;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(tokio::fs::File::open(path).await?)
+    }
+}
+
+fn append_optional_text(mut form: Form, name: &'static str, value: &Option<String>) -> Form {
+    if let Some(value) = value {
+        form = form.text(name, value.clone());
+    }
+    form
+}
+
 async fn decode_json<T>(response: reqwest::Response) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
@@ -385,9 +583,276 @@ struct NoQuery {}
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
     use url::Url;
 
-    use super::{WebexClient, encode_segment, ensure_directory_url, is_same_or_child_path};
+    use crate::types::{CreateMessage, LocalFileAttachment};
+
+    use super::{
+        DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE, MAX_LOCAL_FILE_UPLOAD_BYTES, WebexClient,
+        encode_segment, ensure_directory_url, is_same_or_child_path, open_local_attachment,
+        read_limited_local_attachment, validate_local_attachment_media_type,
+    };
+
+    #[tokio::test]
+    async fn create_message_with_file_sends_multipart_form() {
+        let file_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-note.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "file-body").unwrap();
+
+        let (base_url, captured_request) = spawn_capture_server(
+            r#"{"id":"message-1","roomId":"room-1","text":"attached","files":["https://example.invalid/file"]}"#,
+        )
+        .await;
+        let client = WebexClient::builder()
+            .unwrap()
+            .base_url(base_url)
+            .access_token("token")
+            .build()
+            .unwrap();
+
+        let message = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&file_path)
+                    .with_file_name("note.txt")
+                    .with_media_type("text/plain"),
+            )
+            .await
+            .unwrap();
+
+        let request = captured_request.await.unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert_eq!(message.id.as_deref(), Some("message-1"));
+        assert!(request.starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(lower.contains("authorization: bearer token"));
+        assert!(lower.contains("content-type: multipart/form-data; boundary="));
+        assert!(request.contains("name=\"roomId\""));
+        assert!(request.contains("room-1"));
+        assert!(request.contains("name=\"text\""));
+        assert!(request.contains("attached"));
+        assert!(request.contains("name=\"files\"; filename=\"note.txt\""));
+        assert!(lower.contains("content-type: text/plain"));
+        assert!(request.contains("file-body"));
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_control_characters_in_file_name() {
+        let file_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-unsafe-name.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "file-body").unwrap();
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&file_path).with_file_name("bad\r\nname.txt"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must not contain CR or LF"));
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_invalid_media_type_before_opening_file() {
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new("/definitely/missing.bin")
+                    .with_file_name("missing.bin")
+                    .with_media_type("bad media type"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("media type is invalid"));
+    }
+
+    #[test]
+    fn validate_local_attachment_media_type_accepts_default() {
+        validate_local_attachment_media_type(DEFAULT_LOCAL_ATTACHMENT_MEDIA_TYPE).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_url_files() {
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let mut request = CreateMessage::text("room-1", "attached");
+        request
+            .files
+            .push("https://example.invalid/file.png".to_owned());
+
+        let error = client
+            .create_message_with_file(
+                &request,
+                &LocalFileAttachment::new("/tmp/file.png").with_file_name("file.png"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("use create_message for public file URLs")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_oversized_file_before_read() {
+        let file_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-oversized.bin",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&file_path).unwrap();
+        file.set_len(MAX_LOCAL_FILE_UPLOAD_BYTES + 1).unwrap();
+        drop(file);
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&file_path).with_file_name("oversized.bin"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds Webex 100 MB limit"));
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[tokio::test]
+    async fn create_message_with_file_rejects_non_regular_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-directory",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = client
+            .create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&directory).with_file_name("directory"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("path must be a regular file"));
+
+        let _ = std::fs::remove_dir(directory);
+    }
+
+    #[tokio::test]
+    async fn read_limited_local_attachment_rejects_reader_over_limit() {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_limited_local_attachment(tokio::io::repeat(1), 0, 8),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("9 bytes read"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_local_attachment_rejects_symbolic_links() {
+        let target_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-target.txt",
+            std::process::id()
+        ));
+        let link_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-link.txt",
+            std::process::id()
+        ));
+        std::fs::write(&target_path, "file-body").unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        assert!(open_local_attachment(&link_path).await.is_err());
+
+        let _ = std::fs::remove_file(link_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn open_local_attachment_rejects_windows_symbolic_links() {
+        let target_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-target.txt",
+            std::process::id()
+        ));
+        let link_path = std::env::temp_dir().join(format!(
+            "webex-headless-upload-{}-link.txt",
+            std::process::id()
+        ));
+        std::fs::write(&target_path, "file-body").unwrap();
+        std::os::windows::fs::symlink_file(&target_path, &link_path)
+            .expect("Windows symlink privilege is required to test reparse-point rejection");
+        assert!(open_local_attachment(&link_path).await.is_err());
+        let _ = std::fs::remove_file(link_path);
+
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_message_with_file_rejects_fifo_without_blocking() {
+        let fifo_path =
+            std::env::temp_dir().join(format!("webex-headless-upload-{}-fifo", std::process::id()));
+        let output = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let client = WebexClient::builder()
+            .unwrap()
+            .access_token("token")
+            .build()
+            .unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.create_message_with_file(
+                &CreateMessage::text("room-1", "attached"),
+                &LocalFileAttachment::new(&fifo_path).with_file_name("fifo"),
+            ),
+        )
+        .await
+        .expect("FIFO upload rejection should not block")
+        .unwrap_err();
+        assert!(error.to_string().contains("path must be a regular file"));
+
+        let _ = std::fs::remove_file(fifo_path);
+    }
 
     #[test]
     fn encodes_path_segments() {
@@ -434,5 +899,55 @@ mod tests {
             "/webex/v1evil/messages",
             "/webex/v1/"
         ));
+    }
+
+    async fn spawn_capture_server(response_body: &'static str) -> (Url, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+        });
+
+        (Url::parse(&format!("http://{address}/v1/")).unwrap(), rx)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0, "client closed before request completed");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_bytes(&bytes, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    return bytes;
+                }
+            }
+        }
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }
