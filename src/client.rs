@@ -815,14 +815,10 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&target_path, "file-body").unwrap();
-        match std::os::windows::fs::symlink_file(&target_path, &link_path) {
-            Ok(()) => {
-                assert!(open_local_attachment(&link_path).await.is_err());
-                let _ = std::fs::remove_file(link_path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(error) => panic!("failed to create test symlink: {error}"),
-        }
+        std::os::windows::fs::symlink_file(&target_path, &link_path)
+            .expect("Windows symlink privilege is required to test reparse-point rejection");
+        assert!(open_local_attachment(&link_path).await.is_err());
+        let _ = std::fs::remove_file(link_path);
 
         let _ = std::fs::remove_file(target_path);
     }
