@@ -211,9 +211,11 @@ Local mock E2E without Webex credentials:
 
 ```bash
 WEBEX_SIDECAR_BIND=127.0.0.1:8787 WEBEX_SIDECAR_MAX_EVENTS=1 \
+  WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
   cargo run --example sidecar_receiver --all-features
 
 WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
+  WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
   WEBEX_SIDECAR_MOCK_EVENT=1 node examples/sidecar-js/index.mjs
 ```
 

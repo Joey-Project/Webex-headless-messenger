@@ -15,7 +15,23 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 async fn main() -> Result<()> {
     let bind = env::var("WEBEX_SIDECAR_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let path = env::var("WEBEX_SIDECAR_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
-    let expected_token = env::var("WEBEX_SIDECAR_TOKEN").ok();
+    let allow_unauthenticated = env::var("WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let expected_token = match env::var("WEBEX_SIDECAR_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => Some(token),
+        None if allow_unauthenticated => None,
+        None => {
+            return Err(Error::Other(
+                "WEBEX_SIDECAR_TOKEN is required; set WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED=1 only for local unsafe testing"
+                    .to_owned(),
+            ));
+        }
+    };
     let max_events = env::var("WEBEX_SIDECAR_MAX_EVENTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -24,6 +40,9 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     println!("sidecar_receiver_listening={}", listener.local_addr()?);
     println!("sidecar_receiver_path={path}");
+    if expected_token.is_none() {
+        println!("sidecar_receiver_unauthenticated=true");
+    }
 
     let mut accepted = 0_usize;
     loop {

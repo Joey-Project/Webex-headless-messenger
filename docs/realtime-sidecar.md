@@ -111,7 +111,9 @@ see.
 
 - Bind the receiver to loopback, not a public interface.
 - Set `WEBEX_SIDECAR_TOKEN` on both processes so local POSTs require a bearer
-  token.
+  token. The receiver refuses to start without it unless
+  `WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED=1` is explicitly set for local unsafe
+  testing.
 - Treat forwarded event bodies as untrusted input. The demo prints them; a real
   automation should validate resource/event and deduplicate by message ID.
 - Keep the sidecar and Rust automation under the same supervisor so both stop
