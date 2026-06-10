@@ -1,0 +1,22 @@
+{
+  "name": "webex-headless-sidecar-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mock": "WEBEX_SIDECAR_MOCK_EVENT=1 node index.mjs",
+    "listen": "node index.mjs"
+  },
+  "dependencies": {
+    "@webex/internal-plugin-support": "3.12.0",
+    "@webex/plugin-authorization": "3.12.0",
+    "@webex/plugin-logger": "3.12.0",
+    "@webex/plugin-messages": "3.12.0",
+    "@webex/plugin-people": "3.12.0",
+    "@webex/webex-core": "3.12.0",
+    "lodash": "4.17.21"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}

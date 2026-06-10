@@ -54,6 +54,20 @@ spark:memberships_write
 The generic account must already be a member of any space that the smoke test
 reads or writes.
 
+For realtime sidecar live testing, the Webex JS SDK `messages.listen()` path
+requires broader Messaging SDK scopes. Enable `spark:all` in the Integration
+configuration, confirm `spark:kms` is also enabled, remove the old token cache,
+and re-authorize with an override:
+
+```bash
+WEBEX_TEST_SCOPES="spark:all spark:kms" \
+  cargo run --example smoke --all-features
+```
+
+Refreshing an existing OAuth token does not add newly enabled scopes; re-run
+Device Grant Flow after changing Integration permissions. `WEBEX_TEST_SCOPES` may
+be set in the shell environment or in `.env.webex-test`.
+
 ## Local Environment
 
 Create `.env.webex-test` in the repository root:

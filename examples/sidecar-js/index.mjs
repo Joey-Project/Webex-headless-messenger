@@ -1,0 +1,175 @@
+import { createRequire } from 'node:module';
+import { isIP } from 'node:net';
+
+const targetUrl = process.env.WEBEX_SIDECAR_TARGET_URL ?? 'http://127.0.0.1:8787/webex/events';
+const target = validateTargetUrl(targetUrl);
+const forwardToken = process.env.WEBEX_SIDECAR_TOKEN;
+const forwardTimeoutMs = parsePositiveInteger(process.env.WEBEX_SIDECAR_FORWARD_TIMEOUT_MS, 10000);
+const maxInFlightForwards = parsePositiveInteger(process.env.WEBEX_SIDECAR_MAX_IN_FLIGHT, 8);
+let inFlightForwards = 0;
+const messageEvents = (process.env.WEBEX_SIDECAR_MESSAGE_EVENTS ?? 'created,deleted')
+  .split(',')
+  .map((event) => event.trim())
+  .filter(Boolean);
+let shuttingDown = false;
+
+function messagePayload(event) {
+  return event && typeof event === 'object' && event.data && typeof event.data === 'object'
+    ? event.data
+    : event;
+}
+
+function parsePositiveInteger(value, fallback) {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isLoopbackHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  if (host === 'localhost') {
+    return true;
+  }
+  if (isIP(host) === 4) {
+    return host.split('.')[0] === '127';
+  }
+  return isIP(host) === 6 && host === '::1';
+}
+
+function validateTargetUrl(value) {
+  const parsed = new URL(value);
+  const allowNonLoopback = process.env.WEBEX_SIDECAR_ALLOW_NON_LOOPBACK === '1';
+  if (!allowNonLoopback && !isLoopbackHost(parsed.hostname)) {
+    throw new Error(
+      'WEBEX_SIDECAR_TARGET_URL must use a loopback host; set WEBEX_SIDECAR_ALLOW_NON_LOOPBACK=1 only for an explicitly secured deployment'
+    );
+  }
+  if (allowNonLoopback) {
+    console.warn('sidecar_target_non_loopback_allowed=true');
+  }
+  return parsed;
+}
+
+async function forward(resource, event, data) {
+  const envelope = {
+    version: 1,
+    resource,
+    event,
+    receivedAt: new Date().toISOString(),
+    data,
+  };
+  const headers = {
+    'content-type': 'application/json',
+    'user-agent': 'webex-headless-sidecar-demo/0.1.0',
+  };
+  if (forwardToken) {
+    headers.authorization = `Bearer ${forwardToken}`;
+  }
+
+  if (inFlightForwards >= maxInFlightForwards) {
+    throw new Error(`too many in-flight forwards limit=${maxInFlightForwards}`);
+  }
+  inFlightForwards += 1;
+  try {
+    const response = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(envelope),
+      signal: AbortSignal.timeout(forwardTimeoutMs),
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(`forward failed status=${response.status} body=${body}`);
+    }
+    console.log(`sidecar_forwarded resource=${resource} event=${event} status=${response.status}`);
+  } finally {
+    inFlightForwards -= 1;
+  }
+}
+
+if (process.env.WEBEX_SIDECAR_MOCK_EVENT) {
+  await forward('messages', 'created', {
+    id: 'mock-message',
+    roomId: 'mock-room',
+    personEmail: 'generic-account@example.com',
+    text: 'mock sidecar event',
+    created: new Date().toISOString(),
+  });
+  console.log('sidecar_mock_event_sent=true');
+  process.exit(0);
+}
+
+const accessToken = process.env.WEBEX_ACCESS_TOKEN;
+if (!accessToken) {
+  throw new Error('WEBEX_ACCESS_TOKEN is required unless WEBEX_SIDECAR_MOCK_EVENT=1');
+}
+
+const require = createRequire(import.meta.url);
+const merge = require('lodash/merge');
+const WebexCore = require('@webex/webex-core').default;
+const webexDefaultConfig = require('@webex/webex-core/dist/config.js').default;
+require('@webex/plugin-authorization');
+require('@webex/plugin-logger');
+require('@webex/internal-plugin-support');
+require('@webex/plugin-people');
+require('@webex/plugin-messages');
+
+const Webex = WebexCore.extend({
+  webex: true,
+  version: 'webex-headless-sidecar-demo/0.1.0',
+});
+const webex = new Webex({
+  config: merge({}, webexDefaultConfig, {
+    logger: {
+      level: process.env.WEBEX_SDK_LOG_LEVEL ?? 'error',
+    },
+  }),
+  credentials: {
+    access_token: accessToken,
+  },
+});
+
+await webex.people.get('me');
+await webex.internal.services.waitForCatalog('postauth', 30);
+await webex.messages.listen();
+for (const eventName of messageEvents) {
+  webex.messages.on(eventName, (event) => {
+    forward('messages', eventName, messagePayload(event)).catch((error) => {
+      console.error(error);
+      shutdown(1).catch((shutdownError) => {
+        console.error(shutdownError);
+        process.exit(1);
+      });
+    });
+  });
+}
+
+console.log(`sidecar_listening resource=messages events=${messageEvents.join(',')} target=${target.href}`);
+
+async function shutdown(code = 0) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  for (const eventName of messageEvents) {
+    webex.messages.off(eventName);
+  }
+  await webex.messages.stopListening();
+  process.exit(code);
+}
+
+process.on('SIGINT', () => {
+  shutdown().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+});
+process.on('SIGTERM', () => {
+  shutdown().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+});
+process.stdin.resume();

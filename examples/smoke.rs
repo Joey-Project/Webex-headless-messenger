@@ -29,10 +29,22 @@ async fn main() -> webex_headless_messenger::Result<()> {
     let room_link = optional(&env, "WEBEX_TEST_ROOM_LINK");
     let room_title = optional(&env, "WEBEX_TEST_ROOM_TITLE");
     let person_email = optional(&env, "WEBEX_TEST_PERSON_EMAIL");
+    let scope_override = std::env::var("WEBEX_TEST_SCOPES")
+        .ok()
+        .or_else(|| optional(&env, "WEBEX_TEST_SCOPES").map(ToOwned::to_owned));
 
-    let oauth =
-        OAuthClient::new(OAuthConfig::new(client_id)?.with_client_secret(client_secret.to_owned()));
-    let token = load_or_authorize(&oauth).await?;
+    let mut config = OAuthConfig::new(client_id)?.with_client_secret(client_secret.to_owned());
+    if let Some(scopes) = scope_override
+        .as_deref()
+        .map(parse_scopes)
+        .filter(|scopes| !scopes.is_empty())
+    {
+        println!("scope_override_count={}", scopes.len());
+        config = config.with_scopes(scopes);
+    }
+    let requested_scopes = config.scopes.clone();
+    let oauth = OAuthClient::new(config);
+    let token = load_or_authorize(&oauth, &requested_scopes).await?;
     let client = WebexClient::builder()?
         .token_provider(std::sync::Arc::new(
             webex_headless_messenger::StaticTokenProvider::new(token.access_token),
@@ -102,13 +114,19 @@ async fn main() -> webex_headless_messenger::Result<()> {
     Ok(())
 }
 
-async fn load_or_authorize(oauth: &OAuthClient) -> webex_headless_messenger::Result<TokenSet> {
+async fn load_or_authorize(
+    oauth: &OAuthClient,
+    requested_scopes: &[String],
+) -> webex_headless_messenger::Result<TokenSet> {
     let token_path = PathBuf::from(TOKEN_FILE);
     if let Some(contents) = read_token_cache(&token_path)? {
         let token = serde_json::from_str::<TokenSet>(&contents)?;
         if !token.is_expiring_within(Duration::from_secs(300)) {
-            println!("token_cache=hit");
-            return Ok(token);
+            if token_has_requested_scopes(&token, requested_scopes) {
+                println!("token_cache=hit");
+                return Ok(token);
+            }
+            println!("token_cache=scope_miss");
         }
     }
 
@@ -191,6 +209,69 @@ async fn resolve_room_id(
         count => Err(webex_headless_messenger::Error::Other(format!(
             "WEBEX_TEST_ROOM_TITLE={title:?} matched {count} rooms; set WEBEX_TEST_ROOM_ID"
         ))),
+    }
+}
+
+fn token_has_requested_scopes(token: &TokenSet, requested_scopes: &[String]) -> bool {
+    requested_scopes.iter().all(|requested| {
+        token
+            .scopes
+            .iter()
+            .any(|actual| scope_matches(actual, requested))
+    })
+}
+
+fn scope_matches(actual: &str, requested: &str) -> bool {
+    actual == requested
+        || (actual == "spark:all" && requested.starts_with("spark:") && requested != "spark:kms")
+}
+
+fn parse_scopes(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(scopes: &[&str]) -> TokenSet {
+        TokenSet {
+            access_token: "access-token".to_owned(),
+            refresh_token: Some("refresh-token".to_owned()),
+            token_type: "Bearer".to_owned(),
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            expires_at: None,
+            refresh_token_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn spark_all_token_satisfies_default_rest_scopes_when_kms_is_present() {
+        let requested = vec![
+            "spark:messages_read".to_owned(),
+            "spark:messages_write".to_owned(),
+            "spark:kms".to_owned(),
+        ];
+
+        assert!(token_has_requested_scopes(
+            &token(&["spark:all", "spark:kms"]),
+            &requested
+        ));
+    }
+
+    #[test]
+    fn cached_token_must_include_all_requested_scopes() {
+        let requested = vec!["spark:all".to_owned(), "spark:kms".to_owned()];
+
+        assert!(!token_has_requested_scopes(
+            &token(&["spark:messages_read", "spark:kms"]),
+            &requested,
+        ));
     }
 }
 
