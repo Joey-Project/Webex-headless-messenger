@@ -10,6 +10,7 @@ use webex_headless_messenger::{Error, Result, SidecarEvent};
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_PATH: &str = "/webex/events";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -135,11 +136,6 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             ));
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > MAX_BODY_BYTES {
-            return Err(Error::Other(
-                "request body exceeded maximum size".to_owned(),
-            ));
-        }
         if let Some(header_end) = find_bytes(&bytes, b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..header_end]);
             let content_length = parse_content_length(&headers)?;
@@ -154,6 +150,10 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
                     bytes[header_end + 4..header_end + 4 + content_length].to_vec(),
                 );
             }
+        } else if bytes.len() > MAX_HEADER_BYTES {
+            return Err(Error::Other(
+                "request headers exceeded maximum size".to_owned(),
+            ));
         }
     }
 }
@@ -439,6 +439,21 @@ mod tests {
                 .to_string()
                 .contains("request body exceeded maximum size")
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_accepts_max_body_size_plus_headers() {
+        let body = vec![b'a'; MAX_BODY_BYTES];
+        let mut raw = format!(
+            "POST /webex/events HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body);
+
+        let request = read_request_from_bytes(raw).await.unwrap();
+
+        assert_eq!(request.body.len(), MAX_BODY_BYTES);
     }
 
     #[tokio::test]
