@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { isIP } from 'node:net';
 
 const targetUrl = process.env.WEBEX_SIDECAR_TARGET_URL ?? 'http://127.0.0.1:8787/webex/events';
 const target = validateTargetUrl(targetUrl);
@@ -28,7 +29,13 @@ function parsePositiveInteger(value, fallback) {
 
 function isLoopbackHost(hostname) {
   const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
-  return host === 'localhost' || host.endsWith('.localhost') || host.startsWith('127.') || host === '::1';
+  if (host === 'localhost') {
+    return true;
+  }
+  if (isIP(host) === 4) {
+    return host.split('.')[0] === '127';
+  }
+  return isIP(host) === 6 && host === '::1';
 }
 
 function validateTargetUrl(value) {
