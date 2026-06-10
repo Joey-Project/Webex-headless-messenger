@@ -67,9 +67,11 @@ sidecar_event_accepted_from=127.0.0.1:...
 
 ## Live Webex Listener
 
-Install the JS sidecar dependency once. The demo intentionally uses the SDK's
-minimal messages plugins in Node instead of the default bundle, which also loads
-meetings/calling code intended for browser media paths.
+Install the JS sidecar dependency once. The demo uses direct WebexCore
+messages/people/logger plugin packages instead of the default `webex` bundle,
+which also loads meetings/calling code intended for browser media paths. These
+are still official SDK packages with their own transitive dependency tree; audit
+and pin that tree before treating this demo as production infrastructure.
 
 
 ```bash
@@ -111,7 +113,9 @@ see.
 
 ## Security Boundary
 
-- Bind the receiver to loopback, not a public interface.
+- The receiver bind address and JS target URL must be loopback by default. Set
+  `WEBEX_SIDECAR_ALLOW_NON_LOOPBACK=1` only for an explicitly secured
+  deployment that provides its own transport protection and access controls.
 - Set `WEBEX_SIDECAR_TOKEN` on both processes so local POSTs require a bearer
   token. The receiver refuses to start without it unless
   `WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED=1` is explicitly set for local unsafe

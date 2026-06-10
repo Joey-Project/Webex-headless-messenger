@@ -227,7 +227,7 @@ WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
 
 See [docs/realtime-sidecar.md](docs/realtime-sidecar.md) for live Webex setup,
 required realtime scopes (`spark:all` plus `spark:kms`), forwarding-token
-configuration, and security notes.
+configuration, loopback restrictions, and security notes.
 
 ## Smoke Test
 

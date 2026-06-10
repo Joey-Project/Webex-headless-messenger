@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,6 +19,10 @@ async fn main() -> Result<()> {
         .ok()
         .as_deref()
         == Some("1");
+    let allow_non_loopback =
+        env::var("WEBEX_SIDECAR_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
+    validate_loopback_bind(&bind, allow_non_loopback).await?;
+
     let expected_token = match env::var("WEBEX_SIDECAR_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -43,6 +47,9 @@ async fn main() -> Result<()> {
     if expected_token.is_none() {
         println!("sidecar_receiver_unauthenticated=true");
     }
+    if allow_non_loopback {
+        println!("sidecar_receiver_non_loopback_allowed=true");
+    }
 
     let mut accepted = 0_usize;
     loop {
@@ -66,6 +73,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn validate_loopback_bind(bind: &str, allow_non_loopback: bool) -> Result<()> {
+    let resolved = tokio::net::lookup_host(bind)
+        .await?
+        .collect::<Vec<SocketAddr>>();
+    if resolved.is_empty() {
+        return Err(Error::Other(format!(
+            "WEBEX_SIDECAR_BIND={bind:?} did not resolve"
+        )));
+    }
+    if !allow_non_loopback && !resolved.iter().all(|addr| addr.ip().is_loopback()) {
+        return Err(Error::Other(
+            "WEBEX_SIDECAR_BIND must resolve only to loopback addresses; set WEBEX_SIDECAR_ALLOW_NON_LOOPBACK=1 only for an explicitly secured deployment"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -202,6 +227,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+#[derive(Debug)]
 struct HttpRequest {
     method: String,
     path: String,
@@ -245,5 +271,192 @@ mod tests {
         assert_eq!(response.status, 400);
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["error"], "bad \"quoted\" value");
+    }
+
+    fn valid_event_body() -> Vec<u8> {
+        serde_json::json!({
+            "version": 1,
+            "resource": "messages",
+            "event": "created",
+            "receivedAt": "2026-06-10T00:00:00Z",
+            "data": {
+                "id": "message-1",
+                "roomId": "room-1"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn request(
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        let mut headers = BTreeMap::new();
+        if let Some(value) = authorization {
+            headers.insert("authorization".to_owned(), value.to_owned());
+        }
+        HttpRequest {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            headers,
+            body,
+        }
+    }
+
+    async fn read_request_from_bytes(raw: Vec<u8>) -> Result<HttpRequest> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&raw).await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await?;
+        let parsed = read_request(&mut stream).await;
+        client.await.unwrap();
+        parsed
+    }
+
+    #[test]
+    fn handle_request_accepts_valid_authorized_event() {
+        let response = handle_request(
+            &request(
+                "POST",
+                "/webex/events",
+                Some("Bearer secret-token"),
+                valid_event_body(),
+            ),
+            "/webex/events",
+            Some("secret-token"),
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn handle_request_rejects_unauthorized_wrong_path_and_method() {
+        assert_eq!(
+            handle_request(
+                &request("POST", "/webex/events", None, valid_event_body()),
+                "/webex/events",
+                Some("secret-token"),
+            )
+            .status,
+            401
+        );
+        assert_eq!(
+            handle_request(
+                &request(
+                    "POST",
+                    "/wrong",
+                    Some("Bearer secret-token"),
+                    valid_event_body(),
+                ),
+                "/webex/events",
+                Some("secret-token"),
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            handle_request(
+                &request(
+                    "GET",
+                    "/webex/events",
+                    Some("Bearer secret-token"),
+                    valid_event_body(),
+                ),
+                "/webex/events",
+                Some("secret-token"),
+            )
+            .status,
+            405
+        );
+    }
+
+    #[test]
+    fn handle_request_rejects_invalid_event_body() {
+        let response = handle_request(
+            &request(
+                "POST",
+                "/webex/events",
+                Some("Bearer secret-token"),
+                br#"{"version":"bad"}"#.to_vec(),
+            ),
+            "/webex/events",
+            Some("secret-token"),
+        );
+
+        assert_eq!(response.status, 400);
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_valid_request() {
+        let body = valid_event_body();
+        let raw = format!(
+            "POST /webex/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+        let request = read_request_from_bytes(raw.into_bytes()).await.unwrap();
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/webex/events");
+        assert_eq!(
+            request.headers.get("authorization"),
+            Some(&"Bearer secret-token".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_missing_content_length() {
+        let error = read_request_from_bytes(
+            b"POST /webex/events HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing content-length"));
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_oversized_declared_body() {
+        let raw = format!(
+            "POST /webex/events HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let error = read_request_from_bytes(raw.into_bytes()).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("request body exceeded maximum size")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_bind_without_override() {
+        let error = validate_loopback_bind("0.0.0.0:8787", false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("WEBEX_SIDECAR_BIND must resolve only to loopback addresses")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_loopback_bind() {
+        validate_loopback_bind("127.0.0.1:8787", false)
+            .await
+            .unwrap();
     }
 }

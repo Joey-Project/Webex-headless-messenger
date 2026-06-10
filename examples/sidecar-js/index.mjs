@@ -1,7 +1,11 @@
 import { createRequire } from 'node:module';
 
 const targetUrl = process.env.WEBEX_SIDECAR_TARGET_URL ?? 'http://127.0.0.1:8787/webex/events';
+const target = validateTargetUrl(targetUrl);
 const forwardToken = process.env.WEBEX_SIDECAR_TOKEN;
+const forwardTimeoutMs = parsePositiveInteger(process.env.WEBEX_SIDECAR_FORWARD_TIMEOUT_MS, 10000);
+const maxInFlightForwards = parsePositiveInteger(process.env.WEBEX_SIDECAR_MAX_IN_FLIGHT, 8);
+let inFlightForwards = 0;
 const messageEvents = (process.env.WEBEX_SIDECAR_MESSAGE_EVENTS ?? 'created,deleted')
   .split(',')
   .map((event) => event.trim())
@@ -12,6 +16,33 @@ function messagePayload(event) {
   return event && typeof event === 'object' && event.data && typeof event.data === 'object'
     ? event.data
     : event;
+}
+
+function parsePositiveInteger(value, fallback) {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isLoopbackHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  return host === 'localhost' || host.endsWith('.localhost') || host.startsWith('127.') || host === '::1';
+}
+
+function validateTargetUrl(value) {
+  const parsed = new URL(value);
+  const allowNonLoopback = process.env.WEBEX_SIDECAR_ALLOW_NON_LOOPBACK === '1';
+  if (!allowNonLoopback && !isLoopbackHost(parsed.hostname)) {
+    throw new Error(
+      'WEBEX_SIDECAR_TARGET_URL must use a loopback host; set WEBEX_SIDECAR_ALLOW_NON_LOOPBACK=1 only for an explicitly secured deployment'
+    );
+  }
+  if (allowNonLoopback) {
+    console.warn('sidecar_target_non_loopback_allowed=true');
+  }
+  return parsed;
 }
 
 async function forward(resource, event, data) {
@@ -30,16 +61,25 @@ async function forward(resource, event, data) {
     headers.authorization = `Bearer ${forwardToken}`;
   }
 
-  const response = await fetch(targetUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(envelope),
-  });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`forward failed status=${response.status} body=${body}`);
+  if (inFlightForwards >= maxInFlightForwards) {
+    throw new Error(`too many in-flight forwards limit=${maxInFlightForwards}`);
   }
-  console.log(`sidecar_forwarded resource=${resource} event=${event} status=${response.status}`);
+  inFlightForwards += 1;
+  try {
+    const response = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(envelope),
+      signal: AbortSignal.timeout(forwardTimeoutMs),
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(`forward failed status=${response.status} body=${body}`);
+    }
+    console.log(`sidecar_forwarded resource=${resource} event=${event} status=${response.status}`);
+  } finally {
+    inFlightForwards -= 1;
+  }
 }
 
 if (process.env.WEBEX_SIDECAR_MOCK_EVENT) {
@@ -99,7 +139,7 @@ for (const eventName of messageEvents) {
   });
 }
 
-console.log(`sidecar_listening resource=messages events=${messageEvents.join(',')} target=${targetUrl}`);
+console.log(`sidecar_listening resource=messages events=${messageEvents.join(',')} target=${target.href}`);
 
 async function shutdown(code = 0) {
   if (shuttingDown) {
