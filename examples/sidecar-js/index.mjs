@@ -9,6 +9,12 @@ const messageEvents = (process.env.WEBEX_SIDECAR_MESSAGE_EVENTS ?? 'created,dele
   .filter(Boolean);
 let shuttingDown = false;
 
+function messagePayload(event) {
+  return event && typeof event === 'object' && event.data && typeof event.data === 'object'
+    ? event.data
+    : event;
+}
+
 async function forward(resource, event, data) {
   const envelope = {
     version: 1,
@@ -85,7 +91,7 @@ await webex.internal.services.waitForCatalog('postauth', 30);
 await webex.messages.listen();
 for (const eventName of messageEvents) {
   webex.messages.on(eventName, (event) => {
-    forward('messages', eventName, event).catch((error) => {
+    forward('messages', eventName, messagePayload(event)).catch((error) => {
       console.error(error);
       shutdown(1).catch((shutdownError) => {
         console.error(shutdownError);
