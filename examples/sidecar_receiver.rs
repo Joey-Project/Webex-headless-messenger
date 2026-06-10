@@ -49,15 +49,15 @@ async fn main() -> Result<()> {
         let (mut stream, peer) = listener.accept().await?;
         let status = match timeout(Duration::from_secs(10), read_request(&mut stream)).await {
             Ok(Ok(request)) => handle_request(&request, &path, expected_token.as_deref()),
-            Ok(Err(error)) => {
-                HttpResponse::json(400, format!(r#"{{"ok":false,"error":"{error}"}}"#))
-            }
-            Err(_) => {
-                HttpResponse::json(408, r#"{"ok":false,"error":"request timeout"}"#.to_owned())
-            }
+            Ok(Err(error)) => HttpResponse::json_error(400, error.to_string()),
+            Err(_) => HttpResponse::json_error(408, "request timeout"),
         };
-        write_response(&mut stream, &status).await?;
-        if status.status == 200 {
+        let response_status = status.status;
+        if let Err(error) = write_response(&mut stream, &status).await {
+            eprintln!("sidecar_response_write_failed peer={peer} error={error}");
+            continue;
+        }
+        if response_status == 200 {
             accepted += 1;
             println!("sidecar_event_accepted_from={peer}");
             if max_events > 0 && accepted >= max_events {
@@ -75,18 +75,15 @@ fn handle_request(
     expected_token: Option<&str>,
 ) -> HttpResponse {
     if request.method != "POST" {
-        return HttpResponse::json(
-            405,
-            r#"{"ok":false,"error":"method not allowed"}"#.to_owned(),
-        );
+        return HttpResponse::json_error(405, "method not allowed");
     }
     if request.path != expected_path {
-        return HttpResponse::json(404, r#"{"ok":false,"error":"not found"}"#.to_owned());
+        return HttpResponse::json_error(404, "not found");
     }
     if let Some(token) = expected_token {
         let expected = format!("Bearer {token}");
         if request.headers.get("authorization") != Some(&expected) {
-            return HttpResponse::json(401, r#"{"ok":false,"error":"unauthorized"}"#.to_owned());
+            return HttpResponse::json_error(401, "unauthorized");
         }
     }
 
@@ -96,9 +93,9 @@ fn handle_request(
                 "sidecar_event resource={} event={} payload={}",
                 event.resource, event.event, event.data
             );
-            HttpResponse::json(200, r#"{"ok":true}"#.to_owned())
+            HttpResponse::json_value(200, serde_json::json!({ "ok": true }))
         }
-        Err(error) => HttpResponse::json(400, format!(r#"{{"ok":false,"error":"{error}"}}"#)),
+        Err(error) => HttpResponse::json_error(400, error.to_string()),
     }
 }
 
@@ -218,7 +215,35 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
-    fn json(status: u16, body: String) -> Self {
-        Self { status, body }
+    fn json_value(status: u16, value: serde_json::Value) -> Self {
+        Self {
+            status,
+            body: value.to_string(),
+        }
+    }
+
+    fn json_error(status: u16, error: impl Into<String>) -> Self {
+        Self::json_value(
+            status,
+            serde_json::json!({
+                "ok": false,
+                "error": error.into(),
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_error_escapes_error_messages() {
+        let response = HttpResponse::json_error(400, "bad \"quoted\" value");
+        let parsed: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+
+        assert_eq!(response.status, 400);
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "bad \"quoted\" value");
     }
 }

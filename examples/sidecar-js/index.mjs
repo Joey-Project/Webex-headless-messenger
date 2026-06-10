@@ -1,5 +1,4 @@
 import { createRequire } from 'node:module';
-import { dirname } from 'node:path';
 
 const targetUrl = process.env.WEBEX_SIDECAR_TARGET_URL ?? 'http://127.0.0.1:8787/webex/events';
 const forwardToken = process.env.WEBEX_SIDECAR_TOKEN;
@@ -63,8 +62,7 @@ if (!accessToken) {
 const require = createRequire(import.meta.url);
 const merge = require('lodash/merge');
 const WebexCore = require('@webex/webex-core').default;
-const webexPackageDir = dirname(require.resolve('webex/package'));
-const webexDefaultConfig = require(`${webexPackageDir}/dist/config.js`).default;
+const webexDefaultConfig = require('@webex/webex-core/dist/config.js').default;
 require('@webex/plugin-authorization');
 require('@webex/plugin-logger');
 require('@webex/internal-plugin-support');
