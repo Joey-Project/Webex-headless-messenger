@@ -29,9 +29,20 @@ async fn main() -> webex_headless_messenger::Result<()> {
     let room_link = optional(&env, "WEBEX_TEST_ROOM_LINK");
     let room_title = optional(&env, "WEBEX_TEST_ROOM_TITLE");
     let person_email = optional(&env, "WEBEX_TEST_PERSON_EMAIL");
+    let scope_override = std::env::var("WEBEX_TEST_SCOPES")
+        .ok()
+        .or_else(|| optional(&env, "WEBEX_TEST_SCOPES").map(ToOwned::to_owned));
 
-    let oauth =
-        OAuthClient::new(OAuthConfig::new(client_id)?.with_client_secret(client_secret.to_owned()));
+    let mut config = OAuthConfig::new(client_id)?.with_client_secret(client_secret.to_owned());
+    if let Some(scopes) = scope_override
+        .as_deref()
+        .map(parse_scopes)
+        .filter(|scopes| !scopes.is_empty())
+    {
+        println!("scope_override_count={}", scopes.len());
+        config = config.with_scopes(scopes);
+    }
+    let oauth = OAuthClient::new(config);
     let token = load_or_authorize(&oauth).await?;
     let client = WebexClient::builder()?
         .token_provider(std::sync::Arc::new(
@@ -192,6 +203,15 @@ async fn resolve_room_id(
             "WEBEX_TEST_ROOM_TITLE={title:?} matched {count} rooms; set WEBEX_TEST_ROOM_ID"
         ))),
     }
+}
+
+fn parse_scopes(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn room_id_candidates_from_link(link: &str) -> Vec<String> {

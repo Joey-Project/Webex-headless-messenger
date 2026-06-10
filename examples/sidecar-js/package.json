@@ -1,0 +1,16 @@
+{
+  "name": "webex-headless-sidecar-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mock": "WEBEX_SIDECAR_MOCK_EVENT=1 node index.mjs",
+    "listen": "node index.mjs"
+  },
+  "dependencies": {
+    "webex": "^3.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

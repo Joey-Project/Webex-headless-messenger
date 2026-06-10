@@ -25,6 +25,8 @@ Implemented in the first slice:
 - Structured API errors with `trackingId` and `Retry-After` when available.
 - Polling-based message receiver for deployments without public HTTP ingress.
 - Local file upload helper for `multipart/form-data` message creation.
+- JavaScript SDK realtime sidecar demo that forwards normalized message events
+  to a local Rust loopback receiver.
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
   feature.
 
@@ -33,8 +35,8 @@ Not implemented yet:
 - Adaptive Card builders beyond raw JSON attachment payloads.
 - A native Rust WebSocket/Mercury client. Cisco documents realtime messaging
   listening through the official JavaScript SDK, not as a stable public
-  WebSocket protocol. Use REST polling or a JS SDK sidecar until that boundary is
-  explicitly supported.
+  WebSocket protocol. Use REST polling or the JS SDK sidecar demo until that
+  boundary is explicitly supported.
 
 ## OAuth Scopes
 
@@ -197,6 +199,28 @@ async fn main() -> webex_headless_messenger::Result<()> {
 Polling is intentionally conservative. It de-duplicates by message ID in memory
 and skips existing messages on the first poll by default.
 
+## Realtime Sidecar Demo
+
+This crate does not implement Webex Mercury directly. For deployments that need
+a realtime listener without public ingress, `examples/sidecar-js/index.mjs` uses
+the official Webex JavaScript SDK `messages.listen()` API and forwards normalized
+`SidecarEvent` JSON envelopes to the Rust loopback receiver in
+`examples/sidecar_receiver.rs`.
+
+Local mock E2E without Webex credentials:
+
+```bash
+WEBEX_SIDECAR_BIND=127.0.0.1:8787 WEBEX_SIDECAR_MAX_EVENTS=1 \
+  cargo run --example sidecar_receiver --all-features
+
+WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
+  WEBEX_SIDECAR_MOCK_EVENT=1 node examples/sidecar-js/index.mjs
+```
+
+See [docs/realtime-sidecar.md](docs/realtime-sidecar.md) for live Webex setup,
+required realtime scopes (`spark:all` plus `spark:kms`), forwarding-token
+configuration, and security notes.
+
 ## Smoke Test
 
 For local validation against a real generic account, create `.env.webex-test`
@@ -235,5 +259,9 @@ Device Grant authorization steps, expected output, and troubleshooting.
   <https://developer.webex.com/docs/login-with-webex>
 - Webex Webhooks:
   <https://developer.webex.com/messaging/docs/api/guides/webhooks>
+- Webex Browser SDK Messaging Quick Start:
+  <https://developer.webex.com/docs/browser-sdk-messaging-tutorial>
+- Using Websockets with the Webex JavaScript SDK:
+  <https://developer.webex.com/blog/using-websockets-with-the-webex-javascript-sdk>
 - Official Webex OpenAPI specs:
   <https://github.com/webex/webex-openapi-specs>
