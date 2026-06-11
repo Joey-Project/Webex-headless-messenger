@@ -27,6 +27,8 @@ Implemented in the first slice:
 - Local file upload helper for `multipart/form-data` message creation.
 - JavaScript SDK realtime sidecar demo that forwards normalized message events
   to a local Rust loopback receiver.
+- `webex-headless` CLI for device authorization, room/message REST calls,
+  polling, and a loopback sidecar receiver.
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
   feature.
 
@@ -147,6 +149,62 @@ async fn main() -> webex_headless_messenger::Result<()> {
 Store the resulting refresh token in your application-owned secret storage. The
 crate includes `MemoryTokenStore` for tests and simple processes; production
 headless deployments should provide a durable `TokenStore`.
+
+## CLI
+
+The crate also ships a thin `webex-headless` binary for scripts and local
+operator workflows. It intentionally mirrors the library API instead of adding a
+separate command framework.
+
+Authorize a generic account with Device Grant Flow and store the refreshable
+`TokenSet` JSON locally:
+
+```bash
+cargo run --bin webex-headless -- \
+  --client-id "$WEBEX_CLIENT_ID" \
+  --client-secret "$WEBEX_CLIENT_SECRET" \
+  auth device --token-file .codex-tmp/webex-token.json
+```
+
+Use the token file for REST calls. When `WEBEX_CLIENT_ID` and
+`WEBEX_CLIENT_SECRET` are also set, the CLI refreshes expiring access tokens and
+updates the file. Token-file persistence is currently Unix-only and writes the
+file with owner-only `0600` permissions; on non-Unix platforms, use
+`--stdout-token` and store the JSON in platform secret storage.
+
+```bash
+cargo run --bin webex-headless -- \
+  --token-file .codex-tmp/webex-token.json me
+
+cargo run --bin webex-headless -- \
+  --token-file .codex-tmp/webex-token.json \
+  rooms resolve --link "$WEBEX_TEST_ROOM_LINK"
+
+cargo run --bin webex-headless -- \
+  --token-file .codex-tmp/webex-token.json \
+  messages send --room-id "$WEBEX_ROOM_ID" --text "hello from webex-headless"
+
+cargo run --bin webex-headless -- \
+  --token-file .codex-tmp/webex-token.json \
+  messages reply --room-id "$WEBEX_ROOM_ID" --parent-id "$WEBEX_MESSAGE_ID" \
+  --markdown "reply from **webex-headless**"
+```
+
+One-shot REST commands print pretty JSON. Long-running receivers print compact
+JSON Lines so they can be piped into automation:
+
+```bash
+cargo run --bin webex-headless -- \
+  --token-file .codex-tmp/webex-token.json \
+  poll messages --room-id "$WEBEX_ROOM_ID" --interval-seconds 10
+
+cargo run --bin webex-headless -- \
+  sidecar receive --token dev-sidecar-token --max-events 1
+```
+
+Global auth inputs can also come from `WEBEX_ACCESS_TOKEN`, `WEBEX_TOKEN_FILE`,
+`WEBEX_CLIENT_ID`, and `WEBEX_CLIENT_SECRET`. Run
+`cargo run --bin webex-headless -- --help` for the command list.
 
 ## Local File Upload
 
