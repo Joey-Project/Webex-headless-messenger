@@ -34,6 +34,7 @@ use webex_headless_messenger::{
 
 const DEFAULT_SIDECAR_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_SIDECAR_PATH: &str = "/webex/events";
+const DEFAULT_SIDECAR_HEALTH_PATH: &str = "/healthz";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_SIDECAR_CONNECTIONS: usize = 32;
@@ -60,6 +61,7 @@ async fn execute(cli: Cli) -> CliResult<()> {
     match cli.command {
         Command::Help => unreachable!("help is handled before command execution"),
         Command::AuthDevice(args) => auth_device(&cli.global, args).await,
+        Command::AuthRefresh(args) => auth_refresh(&cli.global, args).await,
         Command::Me => {
             let client = build_client(&cli.global).await?;
             print_json(&client.me().await?)
@@ -172,6 +174,7 @@ struct GlobalOptions {
 enum Command {
     Help,
     AuthDevice(AuthDeviceArgs),
+    AuthRefresh(AuthRefreshArgs),
     Me,
     RoomsList(RoomsListArgs),
     RoomsGet { room_id: String },
@@ -193,6 +196,13 @@ struct AuthDeviceArgs {
     token_file: Option<PathBuf>,
     scopes: Vec<String>,
     stdout_token: bool,
+}
+
+#[derive(Debug, Default)]
+struct AuthRefreshArgs {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +262,7 @@ struct PollMessagesArgs {
 struct SidecarReceiveArgs {
     bind: String,
     path: String,
+    health_path: String,
     token: Option<String>,
     max_events: usize,
     allow_unauthenticated: bool,
@@ -343,10 +354,14 @@ impl Cli {
 
 fn parse_auth(cursor: &mut ArgCursor) -> CliResult<Command> {
     let subcommand = cursor.required("auth subcommand")?;
-    if subcommand != "device" {
-        return Err(CliError(format!("unknown auth subcommand {subcommand:?}")).into());
+    match subcommand.as_str() {
+        "device" => parse_auth_device(cursor),
+        "refresh" => parse_auth_refresh(cursor),
+        _ => Err(CliError(format!("unknown auth subcommand {subcommand:?}")).into()),
     }
+}
 
+fn parse_auth_device(cursor: &mut ArgCursor) -> CliResult<Command> {
     let mut args = AuthDeviceArgs::default();
     while let Some(arg) = cursor.peek().map(str::to_owned) {
         if cursor.take_flag("--stdout-token") {
@@ -366,6 +381,22 @@ fn parse_auth(cursor: &mut ArgCursor) -> CliResult<Command> {
         }
     }
     Ok(Command::AuthDevice(args))
+}
+
+fn parse_auth_refresh(cursor: &mut ArgCursor) -> CliResult<Command> {
+    let mut args = AuthRefreshArgs::default();
+    while let Some(arg) = cursor.peek().map(str::to_owned) {
+        if let Some(value) = cursor.take_option("--client-id")? {
+            args.client_id = Some(value);
+        } else if let Some(value) = cursor.take_option("--client-secret")? {
+            args.client_secret = Some(value);
+        } else if let Some(value) = cursor.take_option("--token-file")? {
+            args.token_file = Some(PathBuf::from(value));
+        } else {
+            return Err(CliError(format!("unknown auth refresh option {arg:?}")).into());
+        }
+    }
+    Ok(Command::AuthRefresh(args))
 }
 
 fn parse_rooms(cursor: &mut ArgCursor) -> CliResult<Command> {
@@ -626,6 +657,7 @@ fn parse_sidecar(cursor: &mut ArgCursor) -> CliResult<Command> {
     let mut args = SidecarReceiveArgs {
         bind: DEFAULT_SIDECAR_BIND.to_owned(),
         path: DEFAULT_SIDECAR_PATH.to_owned(),
+        health_path: DEFAULT_SIDECAR_HEALTH_PATH.to_owned(),
         token: None,
         max_events: 0,
         allow_unauthenticated: false,
@@ -640,6 +672,8 @@ fn parse_sidecar(cursor: &mut ArgCursor) -> CliResult<Command> {
             args.bind = value;
         } else if let Some(value) = cursor.take_option("--path")? {
             args.path = value;
+        } else if let Some(value) = cursor.take_option("--health-path")? {
+            args.health_path = value;
         } else if let Some(value) = cursor.take_option("--token")? {
             args.token = Some(value);
         } else if let Some(value) = cursor.take_option("--max-events")? {
@@ -647,6 +681,11 @@ fn parse_sidecar(cursor: &mut ArgCursor) -> CliResult<Command> {
         } else {
             return Err(CliError(format!("unknown sidecar receive option {arg:?}")).into());
         }
+    }
+    if args.path == args.health_path {
+        return Err(
+            CliError("sidecar receive requires --path and --health-path to differ".into()).into(),
+        );
     }
     Ok(Command::SidecarReceive(args))
 }
@@ -868,6 +907,45 @@ async fn build_token_file_client(
     }
 
     Ok(WebexClient::from_access_token(token_set.access_token)?)
+}
+
+async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResult<()> {
+    let token_file = args
+        .token_file
+        .or_else(|| global.token_file.clone())
+        .or_else(|| env::var("WEBEX_TOKEN_FILE").ok().map(PathBuf::from))
+        .ok_or_else(|| CliError("auth refresh requires --token-file or WEBEX_TOKEN_FILE".into()))?;
+    let current = read_token_file(&token_file).await?;
+    let refresh_token = current
+        .refresh_token
+        .clone()
+        .ok_or_else(|| CliError("token file does not contain a refresh token".into()))?;
+    let client_id = env_or_value(
+        args.client_id.or_else(|| global.client_id.clone()),
+        "WEBEX_CLIENT_ID",
+    )
+    .ok_or_else(|| CliError("--client-id or WEBEX_CLIENT_ID is required".into()))?;
+    let client_secret = env_or_value(
+        args.client_secret.or_else(|| global.client_secret.clone()),
+        "WEBEX_CLIENT_SECRET",
+    )
+    .ok_or_else(|| CliError("--client-secret or WEBEX_CLIENT_SECRET is required".into()))?;
+
+    let oauth = OAuthClient::new(OAuthConfig::new(client_id)?.with_client_secret(client_secret));
+    let mut refreshed = oauth.refresh_token(&refresh_token).await?;
+    if refreshed.refresh_token.is_none() {
+        refreshed.refresh_token = Some(refresh_token);
+        refreshed.refresh_token_expires_at = current.refresh_token_expires_at;
+    }
+    save_token_file(&token_file, &refreshed).await?;
+
+    print_json(&json!({
+        "refreshed": true,
+        "tokenFile": token_file.display().to_string(),
+        "expiresAt": refreshed.expires_at,
+        "refreshTokenExpiresAt": refreshed.refresh_token_expires_at,
+        "scopes": refreshed.scopes,
+    }))
 }
 
 async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<()> {
@@ -1186,6 +1264,7 @@ async fn sidecar_receive(args: SidecarReceiveArgs) -> CliResult<()> {
     let listener = TcpListener::bind(&args.bind).await?;
     eprintln!("sidecar_receiver_listening={}", listener.local_addr()?);
     eprintln!("sidecar_receiver_path={}", args.path);
+    eprintln!("sidecar_receiver_health_path={}", args.health_path);
     if args.allow_non_loopback {
         eprintln!("sidecar_receiver_non_loopback_allowed=true");
     }
@@ -1198,6 +1277,7 @@ async fn sidecar_receive(args: SidecarReceiveArgs) -> CliResult<()> {
     let accept_task = tokio::spawn(accept_sidecar_connections(
         listener,
         args.path,
+        args.health_path,
         expected_token,
         semaphore,
         accepted_sender,
@@ -1222,6 +1302,7 @@ async fn sidecar_receive(args: SidecarReceiveArgs) -> CliResult<()> {
 async fn accept_sidecar_connections(
     listener: TcpListener,
     path: String,
+    health_path: String,
     expected_token: Option<String>,
     semaphore: Arc<Semaphore>,
     accepted_sender: mpsc::Sender<SidecarAccepted>,
@@ -1241,6 +1322,7 @@ async fn accept_sidecar_connections(
             stream,
             peer,
             path.clone(),
+            health_path.clone(),
             expected_token.clone(),
             accepted_sender.clone(),
             permit,
@@ -1252,12 +1334,15 @@ async fn handle_sidecar_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     path: String,
+    health_path: String,
     expected_token: Option<String>,
     accepted_sender: mpsc::Sender<SidecarAccepted>,
     _permit: OwnedSemaphorePermit,
 ) {
     let result = match timeout(Duration::from_secs(10), read_request(&mut stream)).await {
-        Ok(Ok(request)) => handle_sidecar_request(&request, &path, expected_token.as_deref()),
+        Ok(Ok(request)) => {
+            handle_sidecar_request(&request, &path, &health_path, expected_token.as_deref())
+        }
         Ok(Err(error)) => SidecarHandleResult {
             response: HttpResponse::json_error(400, error.to_string()),
             event: None,
@@ -1316,8 +1401,22 @@ struct SidecarHandleResult {
 fn handle_sidecar_request(
     request: &HttpRequest,
     expected_path: &str,
+    health_path: &str,
     expected_token: Option<&str>,
 ) -> SidecarHandleResult {
+    if request.path == health_path {
+        return if request.method == "GET" {
+            SidecarHandleResult {
+                response: HttpResponse::json_value(200, json!({ "ok": true })),
+                event: None,
+            }
+        } else {
+            SidecarHandleResult {
+                response: HttpResponse::json_error(405, "method not allowed"),
+                event: None,
+            }
+        };
+    }
     if request.method != "POST" {
         return SidecarHandleResult {
             response: HttpResponse::json_error(405, "method not allowed"),
@@ -1363,7 +1462,7 @@ async fn read_request(stream: &mut TcpStream) -> CliResult<HttpRequest> {
         bytes.extend_from_slice(&buffer[..read]);
         if let Some(header_end) = find_bytes(&bytes, b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = parse_content_length(&headers)?;
+            let content_length = parse_content_length(&headers)?.unwrap_or(0);
             if content_length > MAX_BODY_BYTES {
                 return Err(CliError("request body exceeded maximum size".into()).into());
             }
@@ -1409,16 +1508,19 @@ fn parse_request(headers: &[u8], body: Vec<u8>) -> CliResult<HttpRequest> {
     })
 }
 
-fn parse_content_length(headers: &str) -> CliResult<usize> {
-    headers
+fn parse_content_length(headers: &str) -> CliResult<Option<usize>> {
+    Ok(headers
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+            name.eq_ignore_ascii_case("content-length").then(|| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| CliError("invalid content-length".into()))
+            })
         })
-        .ok_or_else(|| CliError("missing content-length".into()).into())
+        .transpose()?)
 }
 
 async fn write_response(stream: &mut TcpStream, response: &HttpResponse) -> CliResult<()> {
@@ -1505,6 +1607,7 @@ Global options:
 
 Commands:
   auth device [--token-file PATH] [--scopes LIST] [--scope S] [--stdout-token]
+  auth refresh [--token-file PATH] [--client-id ID] [--client-secret SECRET]
   me
   rooms list [--max N] [--type group|direct] [--team-id ID] [--all]
   rooms get --room-id ID
@@ -1516,7 +1619,7 @@ Commands:
   messages reply --room-id ID --parent-id ID (--text TEXT | --markdown MARKDOWN)
   messages delete --message-id ID
   poll messages --room-id ID [--interval-seconds N] [--max N] [--emit-existing]
-  sidecar receive [--bind ADDR] [--path PATH] [--token TOKEN] [--max-events N] [--allow-unauthenticated] [--allow-non-loopback]
+  sidecar receive [--bind ADDR] [--path PATH] [--health-path PATH] [--token TOKEN] [--max-events N] [--allow-unauthenticated] [--allow-non-loopback]
 "
     );
 }
@@ -1571,6 +1674,23 @@ mod tests {
                 body: MessageBody::Text(_),
                 file: None,
             })
+        ));
+    }
+
+    #[test]
+    fn parses_auth_refresh_token_file() {
+        let cli = Cli::parse([
+            "auth".to_owned(),
+            "refresh".to_owned(),
+            "--token-file".to_owned(),
+            "token.json".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::AuthRefresh(AuthRefreshArgs { token_file: Some(path), .. })
+                if path == Path::new("token.json")
         ));
     }
 
@@ -1684,6 +1804,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sidecar_event_and_health_path_conflict() {
+        let error = Cli::parse([
+            "sidecar".to_owned(),
+            "receive".to_owned(),
+            "--path".to_owned(),
+            "/same".to_owned(),
+            "--health-path".to_owned(),
+            "/same".to_owned(),
+            "--token".to_owned(),
+            "token-1".to_owned(),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--path and --health-path"));
+    }
+
+    #[test]
     fn sidecar_rejects_missing_bearer_token() {
         let request = HttpRequest {
             method: "POST".to_owned(),
@@ -1695,8 +1832,32 @@ mod tests {
             .unwrap(),
         };
 
-        let result = handle_sidecar_request(&request, DEFAULT_SIDECAR_PATH, Some("token-1"));
+        let result = handle_sidecar_request(
+            &request,
+            DEFAULT_SIDECAR_PATH,
+            DEFAULT_SIDECAR_HEALTH_PATH,
+            Some("token-1"),
+        );
         assert_eq!(result.response.status, 401);
+        assert!(result.event.is_none());
+    }
+
+    #[test]
+    fn sidecar_health_check_does_not_require_bearer_token() {
+        let request = HttpRequest {
+            method: "GET".to_owned(),
+            path: DEFAULT_SIDECAR_HEALTH_PATH.to_owned(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let result = handle_sidecar_request(
+            &request,
+            DEFAULT_SIDECAR_PATH,
+            DEFAULT_SIDECAR_HEALTH_PATH,
+            Some("token-1"),
+        );
+        assert_eq!(result.response.status, 200);
         assert!(result.event.is_none());
     }
 
@@ -1714,7 +1875,12 @@ mod tests {
             .unwrap(),
         };
 
-        let result = handle_sidecar_request(&request, DEFAULT_SIDECAR_PATH, Some("token-1"));
+        let result = handle_sidecar_request(
+            &request,
+            DEFAULT_SIDECAR_PATH,
+            DEFAULT_SIDECAR_HEALTH_PATH,
+            Some("token-1"),
+        );
         assert_eq!(result.response.status, 200);
         assert_eq!(result.event.unwrap().resource, "messages");
     }

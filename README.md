@@ -172,6 +172,17 @@ updates the file. Token-file persistence is currently Unix-only and writes the
 file with owner-only `0600` permissions; on non-Unix platforms, use
 `--stdout-token` and store the JSON in platform secret storage.
 
+Long-running services can proactively refresh the same token cache with
+`auth refresh`, for example from a systemd timer or cron job:
+
+```bash
+cargo run --bin webex-headless -- \
+  auth refresh \
+  --token-file .codex-tmp/webex-token.json \
+  --client-id "$WEBEX_CLIENT_ID" \
+  --client-secret "$WEBEX_CLIENT_SECRET"
+```
+
 ```bash
 cargo run --bin webex-headless -- \
   --token-file .codex-tmp/webex-token.json me
@@ -257,13 +268,15 @@ async fn main() -> webex_headless_messenger::Result<()> {
 Polling is intentionally conservative. It de-duplicates by message ID in memory
 and skips existing messages on the first poll by default.
 
-## Realtime Sidecar Demo
+## Realtime Sidecar
 
 This crate does not implement Webex Mercury directly. For deployments that need
 a realtime listener without public ingress, `examples/sidecar-js/index.mjs` uses
 the official Webex JavaScript SDK `messages.listen()` API and forwards normalized
-`SidecarEvent` JSON envelopes to the Rust loopback receiver in
-`examples/sidecar_receiver.rs`.
+`SidecarEvent` JSON envelopes to the Rust loopback receiver. The sidecar can run
+as a long-lived service with token-file reload, bounded forward retries, and a
+localhost health endpoint; pair it with REST catch-up polling and message ID
+de-duplication for recovery after restarts or network gaps.
 
 Local mock E2E without Webex credentials:
 
@@ -285,7 +298,8 @@ WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
 
 See [docs/realtime-sidecar.md](docs/realtime-sidecar.md) for live Webex setup,
 required realtime scopes (`spark:all` plus `spark:kms`), forwarding-token
-configuration, loopback restrictions, and security notes.
+configuration, token refresh/reload, health checks, loopback restrictions, and
+security notes.
 
 ## Smoke Test
 
