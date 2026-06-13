@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "mock": "WEBEX_SIDECAR_MOCK_EVENT=1 node index.mjs",
+    "mock": "WEBEX_SIDECAR_TOKEN=dev-sidecar-token WEBEX_SIDECAR_MOCK_EVENT=1 node index.mjs",
     "listen": "node index.mjs"
   },
   "dependencies": {
