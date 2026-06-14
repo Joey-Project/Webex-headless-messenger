@@ -1082,7 +1082,9 @@ fn ensure_distinct_token_paths(
     let Some(access_token_file) = access_token_file else {
         return Ok(());
     };
-    if lexical_absolute_path(token_file)? == lexical_absolute_path(access_token_file)? {
+    if lexical_absolute_path(token_file)? == lexical_absolute_path(access_token_file)?
+        || canonical_parent_paths_match(token_file, access_token_file)?
+    {
         return Err(CliError("--token-file and --access-token-file must differ".into()).into());
     }
     Ok(())
@@ -1109,6 +1111,26 @@ fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
         }
     }
     Ok(normalized)
+}
+
+fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
+    Ok(matches!(
+        (canonical_parent_path(left)?, canonical_parent_path(right)?),
+        (Some(left), Some(right)) if left == right
+    ))
+}
+
+fn canonical_parent_path(path: &Path) -> CliResult<Option<PathBuf>> {
+    let Some(file_name) = path.file_name() else {
+        return Ok(None);
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return Ok(None);
+    };
+    Ok(Some(parent.join(file_name)))
 }
 
 async fn read_token_file(path: &Path) -> CliResult<TokenSet> {
@@ -1842,6 +1864,35 @@ mod tests {
                 .to_string()
                 .contains("--token-file and --access-token-file must differ")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_parent_equivalent_token_and_access_token_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-path-symlink-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_dir = base.join("real");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let token = real_dir.join("token.json");
+        let alias = alias_dir.join("token.json");
+        let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
