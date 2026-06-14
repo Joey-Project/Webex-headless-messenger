@@ -16,7 +16,7 @@ superseded_by:
 ## Summary
 - Added Linux systemd deployment templates for the realtime sidecar stack.
 - The templates cover the Rust sidecar receiver, JS SDK sidecar, token refresh
-  service/timer, shared target, and a locked-down environment file example.
+  service/timer, shared target, and locked-down environment file examples.
 - Added deployment docs with install, token bootstrap, start, health check, and
   log inspection commands.
 
