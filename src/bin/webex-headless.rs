@@ -1115,22 +1115,38 @@ fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
 
 fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
     Ok(matches!(
-        (canonical_parent_path(left)?, canonical_parent_path(right)?),
+        (
+            canonical_existing_ancestor_path(left)?,
+            canonical_existing_ancestor_path(right)?
+        ),
         (Some(left), Some(right)) if left == right
     ))
 }
 
-fn canonical_parent_path(path: &Path) -> CliResult<Option<PathBuf>> {
-    let Some(file_name) = path.file_name() else {
-        return Ok(None);
-    };
-    let Some(parent) = path.parent() else {
-        return Ok(None);
-    };
-    let Ok(parent) = std::fs::canonicalize(parent) else {
-        return Ok(None);
-    };
-    Ok(Some(parent.join(file_name)))
+fn canonical_existing_ancestor_path(path: &Path) -> CliResult<Option<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        match std::fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(Some(resolved));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Ok(None);
+                };
+                missing.push(name.to_owned());
+                let Some(parent) = cursor.parent() else {
+                    return Ok(None);
+                };
+                cursor = parent;
+            }
+            Err(_) => return Ok(None),
+        }
+    }
 }
 
 async fn read_token_file(path: &Path) -> CliResult<TokenSet> {
@@ -1884,6 +1900,35 @@ mod tests {
 
         let token = real_dir.join("token.json");
         let alias = alias_dir.join("token.json");
+        let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_ancestor_for_missing_parent_token_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-path-missing-parent-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_dir = base.join("real");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let token = real_dir.join("nested").join("token.json");
+        let alias = alias_dir.join("nested").join("token.json");
         let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
 
         assert!(
