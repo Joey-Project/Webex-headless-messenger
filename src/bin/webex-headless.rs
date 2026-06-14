@@ -944,6 +944,7 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
         refreshed.refresh_token = Some(refresh_token);
         refreshed.refresh_token_expires_at = current.refresh_token_expires_at;
     }
+    ensure_distinct_token_paths(&token_file, access_token_file.as_deref())?;
     save_token_file(&token_file, &refreshed).await?;
     if let Some(path) = access_token_file.as_deref() {
         save_access_token_file(path, &refreshed.access_token).await?;
@@ -1024,6 +1025,7 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
     };
 
     if let Some(path) = token_file.as_deref() {
+        ensure_distinct_token_paths(path, access_token_file.as_deref())?;
         save_token_file(path, &token).await?;
     }
     if let Some(path) = access_token_file.as_deref() {
@@ -1069,6 +1071,16 @@ impl TokenStore for FileTokenStore {
     async fn save(&self, token_set: &TokenSet) -> WebexResult<()> {
         save_token_file(&self.path, token_set).await
     }
+}
+
+fn ensure_distinct_token_paths(
+    token_file: &Path,
+    access_token_file: Option<&Path>,
+) -> CliResult<()> {
+    if access_token_file.is_some_and(|path| path == token_file) {
+        return Err(CliError("--token-file and --access-token-file must differ".into()).into());
+    }
+    Ok(())
 }
 
 async fn read_token_file(path: &Path) -> CliResult<TokenSet> {
@@ -1758,6 +1770,25 @@ mod tests {
             }) if path == Path::new("token.json")
                 && access_token_path == Path::new("access-token")
         ));
+    }
+
+    #[test]
+    fn rejects_same_token_and_access_token_paths() {
+        let error =
+            ensure_distinct_token_paths(Path::new("token.json"), Some(Path::new("token.json")))
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn accepts_distinct_token_and_access_token_paths() {
+        ensure_distinct_token_paths(Path::new("token.json"), Some(Path::new("access-token")))
+            .unwrap();
     }
 
     #[cfg(unix)]
