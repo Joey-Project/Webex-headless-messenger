@@ -175,7 +175,10 @@ currently Unix-only and writes the file with owner-only `0600` permissions; on n
 Long-running services can proactively refresh the same token cache with
 `auth refresh`, for example from a systemd timer or cron job. Use
 `--access-token-file` when another process should read only the raw access token.
-The access-token file is written as raw token text with mode `0640`:
+The access-token file is written as raw token text with mode `0640`. When both
+`--token-file` and `--access-token-file` are set, both output paths must be ASCII
+so the CLI can conservatively reject case-insensitive filesystem aliases before
+writing either file:
 
 ```bash
 cargo run --bin webex-headless -- \

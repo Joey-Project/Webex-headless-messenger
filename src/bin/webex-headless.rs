@@ -1143,10 +1143,18 @@ fn ensure_distinct_token_paths(
     let Some(access_token_file) = access_token_file else {
         return Ok(());
     };
-    if paths_equivalent_for_token_output(
-        &lexical_absolute_path(token_file)?,
-        &lexical_absolute_path(access_token_file)?,
-    ) || canonical_parent_paths_match(token_file, access_token_file)?
+    let token_file = lexical_absolute_path(token_file)?;
+    let access_token_file = lexical_absolute_path(access_token_file)?;
+    if token_output_path_has_non_ascii(&token_file)
+        || token_output_path_has_non_ascii(&access_token_file)
+    {
+        return Err(CliError(
+            "--token-file and --access-token-file must use ASCII paths when both are set".into(),
+        )
+        .into());
+    }
+    if paths_equivalent_for_token_output(&token_file, &access_token_file)
+        || canonical_parent_paths_match(&token_file, &access_token_file)?
     {
         return Err(CliError("--token-file and --access-token-file must differ".into()).into());
     }
@@ -1197,11 +1205,19 @@ fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
 }
 
 fn paths_equivalent_for_token_output(left: &Path, right: &Path) -> bool {
-    left == right || case_fold_path(left) == case_fold_path(right)
+    left == right || ascii_case_fold_path(left) == ascii_case_fold_path(right)
 }
 
-fn case_fold_path(path: &Path) -> String {
-    path.as_os_str().to_string_lossy().to_lowercase()
+fn ascii_case_fold_path(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn token_output_path_has_non_ascii(path: &Path) -> bool {
+    !path.as_os_str().to_string_lossy().is_ascii()
 }
 
 fn canonical_existing_ancestor_path(path: &Path) -> CliResult<Option<PathBuf>> {
@@ -2066,17 +2082,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unicode_case_only_token_and_access_token_paths() {
+    fn rejects_non_ascii_token_output_paths() {
         let token = Path::new("/tmp/webex-headless-tök.json");
-        let alias = Path::new("/tmp/webex-headless-TÖK.json");
+        let access = Path::new("/tmp/webex-headless-access-token");
+
+        let error = ensure_distinct_token_paths(token, Some(access)).unwrap_err();
+
+        assert!(error.to_string().contains("must use ASCII paths"));
+    }
+
+    #[test]
+    fn rejects_unicode_fold_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-token-ß.json");
+        let alias = Path::new("/tmp/webex-headless-token-SS.json");
 
         let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("--token-file and --access-token-file must differ")
-        );
+        assert!(error.to_string().contains("must use ASCII paths"));
+    }
+
+    #[test]
+    fn rejects_unicode_normalization_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-token-é.json");
+        let alias = Path::new("/tmp/webex-headless-token-é.json");
+
+        let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
+
+        assert!(error.to_string().contains("must use ASCII paths"));
     }
 
     #[cfg(unix)]
