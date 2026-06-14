@@ -87,8 +87,8 @@ sudo -u webex-headless env \
     --scopes 'spark:all spark:kms'
 ```
 
-Start the stack. The JS sidecar requires one successful token refresh before
-it starts listening, and the timer keeps the same token file fresh afterward:
+Start the stack. The JS sidecar refreshes the token cache before validating its
+config and listening, and the timer keeps the same token file fresh afterward:
 
 ```bash
 sudo systemctl enable --now webex-headless-sidecar.target
@@ -125,8 +125,8 @@ journalctl -u webex-headless-token-refresh.service
   it; the bot must still use REST catch-up and message ID de-duplication to fill
   restart gaps.
 - If you replace the receiver with a bot service, update the target dependencies,
-  the JS service `Requires=` / `After=` lines, and `WEBEX_SIDECAR_TARGET_URL`
+  the JS service `Requires=` line, and `WEBEX_SIDECAR_TARGET_URL`
   together.
 - If startup should accept a raw access-token file without OAuth refresh, remove
-  the JS service dependency on `webex-headless-token-refresh.service` and provide
-  a different token freshness strategy.
+  the JS service startup `auth refresh` step and provide a different token
+  freshness strategy.

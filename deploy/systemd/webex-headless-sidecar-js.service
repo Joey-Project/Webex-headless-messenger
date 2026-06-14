@@ -1,9 +1,9 @@
 [Unit]
 Description=Webex Headless JavaScript realtime sidecar
 Documentation=https://github.com/Joey-Project/Webex-headless-messenger
-After=network-online.target webex-headless-sidecar-receiver.service webex-headless-token-refresh.service
+After=network-online.target webex-headless-sidecar-receiver.service
 Wants=network-online.target
-Requires=webex-headless-sidecar-receiver.service webex-headless-token-refresh.service
+Requires=webex-headless-sidecar-receiver.service
 PartOf=webex-headless-sidecar.target
 StartLimitIntervalSec=300
 StartLimitBurst=12
@@ -14,6 +14,7 @@ User=webex-headless
 Group=webex-headless
 WorkingDirectory=/opt/webex-headless-messenger/examples/sidecar-js
 EnvironmentFile=/etc/webex-headless/webex-headless.env
+ExecStartPre=/usr/local/bin/webex-headless auth refresh --token-file ${WEBEX_TOKEN_FILE}
 ExecStartPre=/usr/bin/env WEBEX_SIDECAR_VALIDATE_CONFIG=1 /usr/bin/node /opt/webex-headless-messenger/examples/sidecar-js/index.mjs
 ExecStart=/usr/bin/node /opt/webex-headless-messenger/examples/sidecar-js/index.mjs
 Restart=on-failure
@@ -21,7 +22,7 @@ RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=20s
 StateDirectory=webex-headless
-ConfigurationDirectory=webex-headless
+StateDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
