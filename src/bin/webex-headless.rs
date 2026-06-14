@@ -1101,7 +1101,7 @@ fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() {
+                if !normalized.pop() && !normalized.has_root() {
                     normalized.push(component.as_os_str());
                 }
             }
@@ -1821,6 +1821,21 @@ mod tests {
         let alias = base.join("nested").join("..").join("token.json");
 
         let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_root_parent_equivalent_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-token.json");
+        let alias = Path::new("/../tmp/webex-headless-token.json");
+
+        let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
 
         assert!(
             error
