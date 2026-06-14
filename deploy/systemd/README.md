@@ -11,12 +11,15 @@ The example manages three pieces:
   forwarded sidecar events and exposes `/healthz`.
 - `webex-headless-sidecar-js.service`: Webex JavaScript SDK listener that
   forwards message events to the receiver and exposes `/readyz` / `/livez`.
-- `webex-headless-token-refresh.timer`: periodic OAuth token refresh.
+- `webex-headless-token-refresh.service` / `.timer`: startup and periodic
+  OAuth token refresh.
 
 The bundled receiver writes accepted events to journald as JSON Lines. For a real
 automation, replace that unit with your bot service or make your bot consume the
 receiver output. Keep the same forwarding token, loopback binding, health checks,
-and token-refresh timer.
+and token-refresh timer. The bundled units intentionally run under one service
+user and shared env file; split users and env files before treating the receiver
+or a replacement bot as a lower-trust component.
 
 ## Assumed Layout
 
@@ -84,7 +87,8 @@ sudo -u webex-headless env \
     --scopes 'spark:all spark:kms'
 ```
 
-Start the stack:
+Start the stack. The JS sidecar requires one successful token refresh before
+it starts listening, and the timer keeps the same token file fresh afterward:
 
 ```bash
 sudo systemctl enable --now webex-headless-sidecar.target
@@ -123,3 +127,6 @@ journalctl -u webex-headless-token-refresh.service
 - If you replace the receiver with a bot service, update the target dependencies,
   the JS service `Requires=` / `After=` lines, and `WEBEX_SIDECAR_TARGET_URL`
   together.
+- If startup should accept a raw access-token file without OAuth refresh, remove
+  the JS service dependency on `webex-headless-token-refresh.service` and provide
+  a different token freshness strategy.

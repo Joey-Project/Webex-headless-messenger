@@ -1,9 +1,9 @@
 [Unit]
 Description=Webex Headless JavaScript realtime sidecar
 Documentation=https://github.com/Joey-Project/Webex-headless-messenger
-After=network-online.target webex-headless-sidecar-receiver.service
+After=network-online.target webex-headless-sidecar-receiver.service webex-headless-token-refresh.service
 Wants=network-online.target
-Requires=webex-headless-sidecar-receiver.service
+Requires=webex-headless-sidecar-receiver.service webex-headless-token-refresh.service
 PartOf=webex-headless-sidecar.target
 StartLimitIntervalSec=300
 StartLimitBurst=12
