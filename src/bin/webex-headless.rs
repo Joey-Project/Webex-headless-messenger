@@ -1102,15 +1102,25 @@ fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() && !normalized.has_root() {
-                    normalized.push(component.as_os_str());
-                }
+            Component::ParentDir | Component::Normal(_) => {
+                push_lexical_component(&mut normalized, component.as_os_str());
             }
-            Component::Normal(value) => normalized.push(value),
         }
     }
     Ok(normalized)
+}
+
+fn push_lexical_component(path: &mut PathBuf, component: &std::ffi::OsStr) {
+    if component == std::ffi::OsStr::new(".") {
+        return;
+    }
+    if component == std::ffi::OsStr::new("..") {
+        if !path.pop() && !path.has_root() {
+            path.push(component);
+        }
+        return;
+    }
+    path.push(component);
 }
 
 fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
@@ -1124,29 +1134,56 @@ fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
 }
 
 fn canonical_existing_ancestor_path(path: &Path) -> CliResult<Option<PathBuf>> {
-    let mut missing = Vec::new();
-    let mut cursor = path;
-    loop {
-        match std::fs::canonicalize(cursor) {
-            Ok(mut resolved) => {
-                for component in missing.iter().rev() {
-                    resolved.push(component);
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        env::current_dir()?
+    };
+    let mut unresolved = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                unresolved.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if unresolved.as_os_str().is_empty() {
+                    if !resolved.pop() && !resolved.has_root() {
+                        resolved.push(component.as_os_str());
+                    }
+                } else {
+                    push_lexical_component(&mut unresolved, component.as_os_str());
                 }
-                return Ok(Some(resolved));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = cursor.file_name() else {
-                    return Ok(None);
-                };
-                missing.push(name.to_owned());
-                let Some(parent) = cursor.parent() else {
-                    return Ok(None);
-                };
-                cursor = parent;
+            Component::Normal(value) => {
+                if unresolved.as_os_str().is_empty() {
+                    let candidate = resolved.join(value);
+                    match std::fs::canonicalize(&candidate) {
+                        Ok(canonical) => resolved = canonical,
+                        Err(_) => unresolved.push(value),
+                    }
+                } else {
+                    unresolved.push(value);
+                }
             }
-            Err(_) => return Ok(None),
         }
     }
+
+    for component in unresolved.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                push_lexical_component(&mut resolved, component.as_os_str());
+            }
+        }
+    }
+
+    Ok(Some(resolved))
 }
 
 async fn read_token_file(path: &Path) -> CliResult<TokenSet> {
@@ -1929,6 +1966,35 @@ mod tests {
 
         let token = real_dir.join("nested").join("token.json");
         let alias = alias_dir.join("nested").join("token.json");
+        let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_ancestor_parent_suffix_token_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-path-parent-suffix-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_dir = base.join("real");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let token = real_dir.join("token.json");
+        let alias = alias_dir.join("missing").join("..").join("token.json");
         let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
 
         assert!(
