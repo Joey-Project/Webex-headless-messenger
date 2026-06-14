@@ -941,22 +941,22 @@ async fn build_token_file_client(
 ) -> CliResult<WebexClient> {
     let token_set = read_token_file(&token_file).await?;
     let client_id = env_or_value(global.client_id.clone(), "WEBEX_CLIENT_ID");
-    let client_secret = resolve_client_secret(
-        global.client_secret.clone(),
-        global.client_secret_file.clone(),
-    )
-    .await?;
 
-    if let (Some(client_id), Some(client_secret), Some(_)) =
-        (client_id, client_secret, token_set.refresh_token.as_ref())
-    {
-        let config = OAuthConfig::new(client_id)?.with_client_secret(client_secret);
-        let oauth = OAuthClient::new(config);
-        let store = Arc::new(FileTokenStore::new(token_file));
-        let provider = RefreshingTokenProvider::new(oauth, store);
-        return Ok(WebexClient::builder()?
-            .token_provider(Arc::new(provider))
-            .build()?);
+    if let (Some(client_id), Some(_)) = (client_id, token_set.refresh_token.as_ref()) {
+        if let Some(client_secret) = resolve_client_secret(
+            global.client_secret.clone(),
+            global.client_secret_file.clone(),
+        )
+        .await?
+        {
+            let config = OAuthConfig::new(client_id)?.with_client_secret(client_secret);
+            let oauth = OAuthClient::new(config);
+            let store = Arc::new(FileTokenStore::new(token_file));
+            let provider = RefreshingTokenProvider::new(oauth, store);
+            return Ok(WebexClient::builder()?
+                .token_provider(Arc::new(provider))
+                .build()?);
+        }
     }
 
     Ok(WebexClient::from_access_token(token_set.access_token)?)
@@ -1197,11 +1197,11 @@ fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
 }
 
 fn paths_equivalent_for_token_output(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    left == right || case_fold_path(left) == case_fold_path(right)
+}
+
+fn case_fold_path(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().to_lowercase()
 }
 
 fn canonical_existing_ancestor_path(path: &Path) -> CliResult<Option<PathBuf>> {
@@ -1971,6 +1971,42 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn token_file_client_without_refresh_ignores_missing_secret_file() {
+        let path = std::env::temp_dir().join(format!(
+            "webex-headless-access-token-only-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let token = TokenSet {
+            access_token: "access-token".to_owned(),
+            refresh_token: None,
+            token_type: "Bearer".to_owned(),
+            scopes: vec![],
+            expires_at: None,
+            refresh_token_expires_at: None,
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&token).unwrap())
+            .await
+            .unwrap();
+
+        let client = build_token_file_client(
+            &GlobalOptions {
+                client_id: Some("client-id".to_owned()),
+                client_secret_file: Some(path.with_file_name("missing-client-secret")),
+                ..GlobalOptions::default()
+            },
+            path.clone(),
+        )
+        .await;
+
+        assert!(client.is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn rejects_same_token_and_access_token_paths() {
         let error =
@@ -2019,6 +2055,20 @@ mod tests {
     fn rejects_case_only_token_and_access_token_paths() {
         let token = Path::new("/tmp/webex-headless-token.json");
         let alias = Path::new("/tmp/WEBEX-HEADLESS-TOKEN.JSON");
+
+        let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn rejects_unicode_case_only_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-tök.json");
+        let alias = Path::new("/tmp/webex-headless-TÖK.json");
 
         let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
 
