@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqwest::{StatusCode, header::HeaderMap};
 use serde_json::Value;
@@ -185,15 +185,24 @@ fn tracking_id_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
+    let value = headers
         .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(value).ok()?;
+    match deadline.duration_since(SystemTime::now()) {
+        Ok(remaining) => Some(remaining),
+        Err(_) => Some(Duration::ZERO),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
     use super::parse_retry_after;
@@ -203,5 +212,59 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("42"));
         assert_eq!(parse_retry_after(&headers).unwrap().as_secs(), 42);
+    }
+
+    #[test]
+    fn parses_http_date_retry_after() {
+        let deadline = SystemTime::now() + Duration::from_secs(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(deadline)).unwrap(),
+        );
+        let retry_after = parse_retry_after(&headers).unwrap();
+        assert!(retry_after.as_secs() <= 60);
+        assert!(retry_after.as_secs() >= 55);
+    }
+
+    #[test]
+    fn parses_http_date_retry_after_with_gmt_timezone() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"),
+        );
+        assert!(parse_retry_after(&headers).is_some());
+    }
+
+    #[test]
+    fn parses_rfc850_retry_after_as_zero_when_past() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Sunday, 06-Nov-94 08:49:37 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parses_asctime_retry_after_as_zero_when_past() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parses_past_http_date_retry_after_as_zero() {
+        let deadline = SystemTime::now() - Duration::from_secs(5);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(deadline)).unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
     }
 }
