@@ -197,6 +197,7 @@ struct AuthDeviceArgs {
     client_secret_file: Option<PathBuf>,
     token_file: Option<PathBuf>,
     access_token_file: Option<PathBuf>,
+    access_token_file_group_readable: bool,
     scopes: Vec<String>,
     stdout_token: bool,
 }
@@ -208,6 +209,7 @@ struct AuthRefreshArgs {
     client_secret_file: Option<PathBuf>,
     token_file: Option<PathBuf>,
     access_token_file: Option<PathBuf>,
+    access_token_file_group_readable: bool,
 }
 
 #[derive(Debug, Default)]
@@ -383,6 +385,8 @@ fn parse_auth_device(cursor: &mut ArgCursor) -> CliResult<Command> {
             args.token_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--access-token-file")? {
             args.access_token_file = Some(PathBuf::from(value));
+        } else if cursor.take_flag("--access-token-file-group-readable") {
+            args.access_token_file_group_readable = true;
         } else if let Some(value) = cursor.take_option("--scopes")? {
             args.scopes.extend(parse_scopes(&value));
         } else if let Some(value) = cursor.take_option("--scope")? {
@@ -407,6 +411,8 @@ fn parse_auth_refresh(cursor: &mut ArgCursor) -> CliResult<Command> {
             args.token_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--access-token-file")? {
             args.access_token_file = Some(PathBuf::from(value));
+        } else if cursor.take_flag("--access-token-file-group-readable") {
+            args.access_token_file_group_readable = true;
         } else {
             return Err(CliError(format!("unknown auth refresh option {arg:?}")).into());
         }
@@ -964,6 +970,7 @@ async fn build_token_file_client(
 
 async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResult<()> {
     let access_token_file = args.access_token_file;
+    let access_token_file_mode = access_token_file_mode(args.access_token_file_group_readable);
     let client_secret_value = args.client_secret.or_else(|| global.client_secret.clone());
     let client_secret_file = args
         .client_secret_file
@@ -1009,7 +1016,7 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
     }
     save_token_file(&token_file, &refreshed).await?;
     if let Some(path) = access_token_file.as_deref() {
-        save_access_token_file(path, &refreshed.access_token).await?;
+        save_access_token_file(path, &refreshed.access_token, access_token_file_mode).await?;
     }
 
     print_json(&json!({
@@ -1026,6 +1033,7 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
 
 async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<()> {
     let access_token_file = args.access_token_file;
+    let access_token_file_mode = access_token_file_mode(args.access_token_file_group_readable);
     let client_secret_value = args.client_secret.or_else(|| global.client_secret.clone());
     let client_secret_file = args
         .client_secret_file
@@ -1106,7 +1114,7 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
         save_token_file(path, &token).await?;
     }
     if let Some(path) = access_token_file.as_deref() {
-        save_access_token_file(path, &token.access_token).await?;
+        save_access_token_file(path, &token.access_token, access_token_file_mode).await?;
     }
 
     if args.stdout_token {
@@ -1354,9 +1362,13 @@ async fn save_token_file(path: &Path, token_set: &TokenSet) -> WebexResult<()> {
     save_bytes_file(path, serde_json::to_vec_pretty(token_set)?, 0o600).await
 }
 
+fn access_token_file_mode(group_readable: bool) -> u32 {
+    if group_readable { 0o640 } else { 0o600 }
+}
+
 #[cfg(unix)]
-async fn save_access_token_file(path: &Path, access_token: &str) -> WebexResult<()> {
-    save_bytes_file(path, access_token.as_bytes().to_vec(), 0o640).await
+async fn save_access_token_file(path: &Path, access_token: &str, mode: u32) -> WebexResult<()> {
+    save_bytes_file(path, access_token.as_bytes().to_vec(), mode).await
 }
 
 #[cfg(unix)]
@@ -1402,7 +1414,7 @@ async fn save_token_file(path: &Path, _token_set: &TokenSet) -> WebexResult<()> 
 }
 
 #[cfg(not(unix))]
-async fn save_access_token_file(path: &Path, _access_token: &str) -> WebexResult<()> {
+async fn save_access_token_file(path: &Path, _access_token: &str, _mode: u32) -> WebexResult<()> {
     Err(WebexError::Other(format!(
         "persistent access-token files are only supported on Unix by this CLI: {}",
         path.display()
@@ -1917,8 +1929,8 @@ Global options:
   --client-secret-file PATH  File containing Integration client secret. Env: WEBEX_CLIENT_SECRET_FILE
 
 Commands:
-  auth device [--token-file PATH] [--access-token-file PATH] [--client-secret-file PATH] [--scopes LIST] [--scope S] [--stdout-token]
-  auth refresh [--token-file PATH] [--access-token-file PATH] [--client-id ID] [--client-secret SECRET] [--client-secret-file PATH]
+  auth device [--token-file PATH] [--access-token-file PATH] [--access-token-file-group-readable] [--client-secret-file PATH] [--scopes LIST] [--scope S] [--stdout-token]
+  auth refresh [--token-file PATH] [--access-token-file PATH] [--access-token-file-group-readable] [--client-id ID] [--client-secret SECRET] [--client-secret-file PATH]
   me
   rooms list [--max N] [--type group|direct] [--team-id ID] [--all]
   rooms get --room-id ID
@@ -1997,6 +2009,7 @@ mod tests {
             "token.json".to_owned(),
             "--access-token-file".to_owned(),
             "access-token".to_owned(),
+            "--access-token-file-group-readable".to_owned(),
         ])
         .unwrap();
 
@@ -2005,6 +2018,7 @@ mod tests {
             Command::AuthDevice(AuthDeviceArgs {
                 token_file: Some(path),
                 access_token_file: Some(access_token_path),
+                access_token_file_group_readable: true,
                 ..
             }) if path == Path::new("token.json")
                 && access_token_path == Path::new("access-token")
@@ -2022,6 +2036,7 @@ mod tests {
             "access-token".to_owned(),
             "--client-secret-file".to_owned(),
             "client-secret".to_owned(),
+            "--access-token-file-group-readable".to_owned(),
         ])
         .unwrap();
 
@@ -2031,6 +2046,7 @@ mod tests {
                 token_file: Some(path),
                 access_token_file: Some(access_token_path),
                 client_secret_file: Some(client_secret_path),
+                access_token_file_group_readable: true,
                 ..
             }) if path == Path::new("token.json")
                 && access_token_path == Path::new("access-token")
@@ -2404,7 +2420,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn access_token_file_store_writes_raw_token_with_group_read() {
+    async fn access_token_file_store_writes_raw_token_private_by_default() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let path = std::env::temp_dir().join(format!(
@@ -2416,7 +2432,35 @@ mod tests {
                 .as_nanos()
         ));
 
-        save_access_token_file(&path, "access-token").await.unwrap();
+        save_access_token_file(&path, "access-token", access_token_file_mode(false))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "access-token");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_token_file_store_can_write_raw_token_group_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "webex-headless-group-access-token-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        save_access_token_file(&path, "access-token", access_token_file_mode(true))
+            .await
+            .unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "access-token");
         assert_eq!(

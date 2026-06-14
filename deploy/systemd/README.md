@@ -18,9 +18,10 @@ The bundled receiver writes accepted events to journald as JSON Lines. For a rea
 automation, replace that unit with your bot service or make your bot consume the
 receiver output. Keep the same forwarding token, loopback binding, health checks,
 and token-refresh timer. OAuth credentials and the refresh-token cache stay
-under the token-refresh identity. The token-refresh service publishes a separate
-raw access-token file for the JS sidecar, and the receiver runs under an identity with no OAuth token
-file access.
+under the token-refresh identity. The token-refresh service explicitly opts into
+a group-readable raw access-token file for the JS sidecar inside a dedicated
+setgid directory; the receiver runs under an identity with no OAuth token file
+access.
 
 ## Assumed Layout
 
@@ -119,6 +120,7 @@ sudo systemd-run --wait --collect --pty \
     --client-secret-file /etc/webex-headless/webex-client-secret \
     --token-file /var/lib/webex-headless-token/token.json \
     --access-token-file /var/lib/webex-headless-access/access-token \
+    --access-token-file-group-readable \
     --scopes 'spark:all spark:kms'
 ```
 
@@ -156,6 +158,9 @@ journalctl -u webex-headless-token-refresh.service
 
 - Keep `WEBEX_SIDECAR_TOKEN` identical in the receiver and JS sidecar env files.
 - Keep `WEBEX_ACCESS_TOKEN_FILE` identical in the JS sidecar and token-refresh env files.
+  The CLI writes raw access-token files as `0600` by default; this template uses
+  `--access-token-file-group-readable` only with the dedicated
+  `webex-headless-sidecar` group and setgid access-token directory.
 - Keep `WEBEX_REFRESH_TOKEN_FILE` private to the token-refresh env file; it stores
   the full refreshable `TokenSet` cache.
 - Keep `WEBEX_CLIENT_SECRET_FILE` private to the token-refresh env file, and keep
