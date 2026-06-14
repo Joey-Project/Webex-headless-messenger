@@ -964,12 +964,24 @@ async fn build_token_file_client(
 
 async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResult<()> {
     let access_token_file = args.access_token_file;
+    let client_secret_value = args.client_secret.or_else(|| global.client_secret.clone());
+    let client_secret_file = args
+        .client_secret_file
+        .or_else(|| global.client_secret_file.clone());
+    let effective_client_secret_file = effective_client_secret_file_path(
+        client_secret_value.as_ref(),
+        client_secret_file.as_ref(),
+    );
     let token_file = args
         .token_file
         .or_else(|| global.token_file.clone())
         .or_else(|| env::var("WEBEX_TOKEN_FILE").ok().map(PathBuf::from))
         .ok_or_else(|| CliError("auth refresh requires --token-file or WEBEX_TOKEN_FILE".into()))?;
-    ensure_distinct_token_paths(&token_file, access_token_file.as_deref())?;
+    ensure_distinct_auth_file_paths(
+        Some(&token_file),
+        access_token_file.as_deref(),
+        effective_client_secret_file.as_deref(),
+    )?;
     let current = read_token_file(&token_file).await?;
     let refresh_token = current
         .refresh_token
@@ -980,18 +992,14 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
         "WEBEX_CLIENT_ID",
     )
     .ok_or_else(|| CliError("--client-id or WEBEX_CLIENT_ID is required".into()))?;
-    let client_secret = resolve_client_secret(
-        args.client_secret.or_else(|| global.client_secret.clone()),
-        args.client_secret_file
-            .or_else(|| global.client_secret_file.clone()),
-    )
-    .await?
-    .ok_or_else(|| {
-        CliError(
-            "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
-                .into(),
-        )
-    })?;
+    let client_secret = resolve_client_secret(client_secret_value, client_secret_file)
+        .await?
+        .ok_or_else(|| {
+            CliError(
+                "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
+                    .into(),
+            )
+        })?;
 
     let oauth = OAuthClient::new(OAuthConfig::new(client_id)?.with_client_secret(client_secret));
     let mut refreshed = oauth.refresh_token(&refresh_token).await?;
@@ -1018,23 +1026,19 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
 
 async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<()> {
     let access_token_file = args.access_token_file;
+    let client_secret_value = args.client_secret.or_else(|| global.client_secret.clone());
+    let client_secret_file = args
+        .client_secret_file
+        .or_else(|| global.client_secret_file.clone());
+    let effective_client_secret_file = effective_client_secret_file_path(
+        client_secret_value.as_ref(),
+        client_secret_file.as_ref(),
+    );
     let client_id = env_or_value(
         args.client_id.or_else(|| global.client_id.clone()),
         "WEBEX_CLIENT_ID",
     )
     .ok_or_else(|| CliError("--client-id or WEBEX_CLIENT_ID is required".into()))?;
-    let client_secret = resolve_client_secret(
-        args.client_secret.or_else(|| global.client_secret.clone()),
-        args.client_secret_file
-            .or_else(|| global.client_secret_file.clone()),
-    )
-    .await?
-    .ok_or_else(|| {
-        CliError(
-            "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
-                .into(),
-        )
-    })?;
     let token_file = args
         .token_file
         .or_else(|| global.token_file.clone())
@@ -1045,9 +1049,19 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
         )
         .into());
     }
-    if let Some(path) = token_file.as_deref() {
-        ensure_distinct_token_paths(path, access_token_file.as_deref())?;
-    }
+    ensure_distinct_auth_file_paths(
+        token_file.as_deref(),
+        access_token_file.as_deref(),
+        effective_client_secret_file.as_deref(),
+    )?;
+    let client_secret = resolve_client_secret(client_secret_value, client_secret_file)
+        .await?
+        .ok_or_else(|| {
+            CliError(
+                "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
+                    .into(),
+            )
+        })?;
 
     let scopes = if args.scopes.is_empty() {
         DEFAULT_MESSAGING_SCOPES
@@ -1143,22 +1157,79 @@ fn ensure_distinct_token_paths(
     let Some(access_token_file) = access_token_file else {
         return Ok(());
     };
-    let token_file_absolute = lexical_absolute_path(token_file)?;
-    let access_token_file_absolute = lexical_absolute_path(access_token_file)?;
-    if token_output_path_has_non_ascii(&token_file_absolute)
-        || token_output_path_has_non_ascii(&access_token_file_absolute)
-    {
-        return Err(CliError(
-            "--token-file and --access-token-file must use ASCII paths when both are set".into(),
-        )
-        .into());
+    ensure_distinct_auth_paths(
+        token_file,
+        access_token_file,
+        "--token-file and --access-token-file must use ASCII paths when both are set",
+        "--token-file and --access-token-file must differ",
+    )
+}
+
+fn ensure_distinct_auth_file_paths(
+    token_file: Option<&Path>,
+    access_token_file: Option<&Path>,
+    client_secret_file: Option<&Path>,
+) -> CliResult<()> {
+    if let Some(token_file) = token_file {
+        ensure_distinct_token_paths(token_file, access_token_file)?;
     }
-    if paths_equivalent_for_token_output(&token_file_absolute, &access_token_file_absolute)
-        || canonical_parent_paths_match(token_file, access_token_file)?
-    {
-        return Err(CliError("--token-file and --access-token-file must differ".into()).into());
+
+    let Some(client_secret_file) = client_secret_file else {
+        return Ok(());
+    };
+
+    if let Some(token_file) = token_file {
+        ensure_distinct_auth_paths(
+            token_file,
+            client_secret_file,
+            "--client-secret-file and token output paths must use ASCII paths when combined",
+            "--client-secret-file must differ from --token-file",
+        )?;
+    }
+    if let Some(access_token_file) = access_token_file {
+        ensure_distinct_auth_paths(
+            access_token_file,
+            client_secret_file,
+            "--client-secret-file and token output paths must use ASCII paths when combined",
+            "--client-secret-file must differ from --access-token-file",
+        )?;
     }
     Ok(())
+}
+
+fn ensure_distinct_auth_paths(
+    left: &Path,
+    right: &Path,
+    non_ascii_message: &'static str,
+    equivalent_message: &'static str,
+) -> CliResult<()> {
+    let left_absolute = lexical_absolute_path(left)?;
+    let right_absolute = lexical_absolute_path(right)?;
+    if auth_path_has_non_ascii(&left_absolute) || auth_path_has_non_ascii(&right_absolute) {
+        return Err(CliError(non_ascii_message.into()).into());
+    }
+    if paths_equivalent_for_token_output(&left_absolute, &right_absolute)
+        || canonical_parent_paths_match(left, right)?
+    {
+        return Err(CliError(equivalent_message.into()).into());
+    }
+    Ok(())
+}
+
+fn effective_client_secret_file_path(
+    value: Option<&String>,
+    file: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    if value.is_some_and(|value| !value.trim().is_empty()) {
+        return None;
+    }
+    if let Some(path) = file.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(path.clone());
+    }
+    if env_or_value(None, "WEBEX_CLIENT_SECRET").is_some() {
+        return None;
+    }
+    env_or_path(None, "WEBEX_CLIENT_SECRET_FILE")
 }
 
 fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
@@ -1216,7 +1287,7 @@ fn ascii_case_fold_path(path: &Path) -> String {
         .collect()
 }
 
-fn token_output_path_has_non_ascii(path: &Path) -> bool {
+fn auth_path_has_non_ascii(path: &Path) -> bool {
     !path.as_os_str().to_string_lossy().is_ascii()
 }
 
@@ -2223,6 +2294,68 @@ mod tests {
             error
                 .to_string()
                 .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rejects_token_file_matching_client_secret_file() {
+        let error = ensure_distinct_auth_file_paths(
+            Some(Path::new("secret")),
+            None,
+            Some(Path::new("secret")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--client-secret-file must differ from --token-file")
+        );
+    }
+
+    #[test]
+    fn rejects_access_token_file_matching_client_secret_file_without_token_file() {
+        let error = ensure_distinct_auth_file_paths(
+            None,
+            Some(Path::new("secret")),
+            Some(Path::new("secret")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--client-secret-file must differ from --access-token-file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_access_token_file_matching_client_secret_file() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-secret-alias-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_dir = base.join("real");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let secret = real_dir.join("client-secret");
+        let access = alias_dir.join("client-secret");
+        let error =
+            ensure_distinct_auth_file_paths(None, Some(&access), Some(&secret)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--client-secret-file must differ from --access-token-file")
         );
         std::fs::remove_file(&alias_dir).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
