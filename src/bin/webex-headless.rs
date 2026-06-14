@@ -1143,18 +1143,18 @@ fn ensure_distinct_token_paths(
     let Some(access_token_file) = access_token_file else {
         return Ok(());
     };
-    let token_file = lexical_absolute_path(token_file)?;
-    let access_token_file = lexical_absolute_path(access_token_file)?;
-    if token_output_path_has_non_ascii(&token_file)
-        || token_output_path_has_non_ascii(&access_token_file)
+    let token_file_absolute = lexical_absolute_path(token_file)?;
+    let access_token_file_absolute = lexical_absolute_path(access_token_file)?;
+    if token_output_path_has_non_ascii(&token_file_absolute)
+        || token_output_path_has_non_ascii(&access_token_file_absolute)
     {
         return Err(CliError(
             "--token-file and --access-token-file must use ASCII paths when both are set".into(),
         )
         .into());
     }
-    if paths_equivalent_for_token_output(&token_file, &access_token_file)
-        || canonical_parent_paths_match(&token_file, &access_token_file)?
+    if paths_equivalent_for_token_output(&token_file_absolute, &access_token_file_absolute)
+        || canonical_parent_paths_match(token_file, access_token_file)?
     {
         return Err(CliError("--token-file and --access-token-file must differ".into()).into());
     }
@@ -2187,6 +2187,36 @@ mod tests {
 
         let token = real_dir.join("token.json");
         let alias = alias_dir.join("missing").join("..").join("token.json");
+        let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_target_parent_token_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-path-symlink-target-parent-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_parent = base.join("real");
+        let real_child = real_parent.join("child");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_child).unwrap();
+        std::os::unix::fs::symlink(&real_child, &alias_dir).unwrap();
+
+        let token = real_parent.join("token.json");
+        let alias = alias_dir.join("..").join("token.json");
         let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
 
         assert!(
