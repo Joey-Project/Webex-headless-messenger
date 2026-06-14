@@ -147,8 +147,8 @@ journalctl -u webex-headless-token-refresh.service
   it; the bot must still use REST catch-up and message ID de-duplication to fill
   restart gaps.
 - If you replace the receiver with a bot service, update the target dependencies,
-  the JS service `Requires=` line, and `WEBEX_SIDECAR_TARGET_URL`
-  together.
+  the JS service `Requires=` and `After=` lines, and
+  `WEBEX_SIDECAR_TARGET_URL` together.
 - The JS startup refresh is best-effort through `Wants=` / `After=` on the
   token-refresh service, so a transient Webex or network outage does not block
   startup when the cached token is still usable. The timer keeps retrying
