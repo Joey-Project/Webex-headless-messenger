@@ -101,8 +101,10 @@ cargo run --bin webex-headless -- \
 
 Start the JS SDK sidecar with a raw access-token file published by
 `webex-headless auth device --access-token-file` or `auth refresh --access-token-file`.
-For local testing, `WEBEX_TOKEN_FILE` can still point at a refreshable `TokenSet`
-JSON file:
+The CLI writes that raw token file as `0600` by default; when a separate sidecar
+Unix identity must read it, publish it with `--access-token-file-group-readable`
+inside a dedicated group-readable directory. For local testing, `WEBEX_TOKEN_FILE`
+can still point at a refreshable `TokenSet` JSON file:
 
 ```bash
 cd examples/sidecar-js
@@ -125,6 +127,7 @@ cargo run --bin webex-headless -- \
   auth device \
   --token-file /var/lib/webex-headless-token/token.json \
   --access-token-file /var/lib/webex-headless-access/access-token \
+  --access-token-file-group-readable \
   --scopes "spark:all spark:kms"
 ```
 
@@ -153,6 +156,7 @@ cargo run --bin webex-headless -- \
   auth refresh \
   --token-file /var/lib/webex-headless-token/token.json \
   --access-token-file /var/lib/webex-headless-access/access-token \
+  --access-token-file-group-readable \
   --client-id "$WEBEX_CLIENT_ID" \
   --client-secret-file /etc/webex-headless/webex-client-secret
 ```

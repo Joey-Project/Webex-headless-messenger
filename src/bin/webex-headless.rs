@@ -1216,8 +1216,8 @@ fn ensure_distinct_auth_paths(
     if auth_path_has_non_ascii(&left_absolute) || auth_path_has_non_ascii(&right_absolute) {
         return Err(CliError(non_ascii_message.into()).into());
     }
-    if paths_equivalent_for_token_output(&left_absolute, &right_absolute)
-        || canonical_parent_paths_match(left, right)?
+    if paths_overlap_for_token_output(&left_absolute, &right_absolute)
+        || canonical_parent_paths_overlap(left, right)?
     {
         return Err(CliError(equivalent_message.into()).into());
     }
@@ -1273,25 +1273,36 @@ fn push_lexical_component(path: &mut PathBuf, component: &std::ffi::OsStr) {
     path.push(component);
 }
 
-fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
+fn canonical_parent_paths_overlap(left: &Path, right: &Path) -> CliResult<bool> {
     Ok(matches!(
         (
             canonical_existing_ancestor_path(left)?,
             canonical_existing_ancestor_path(right)?
         ),
-        (Some(left), Some(right)) if paths_equivalent_for_token_output(&left, &right)
+        (Some(left), Some(right)) if paths_overlap_for_token_output(&left, &right)
     ))
 }
 
-fn paths_equivalent_for_token_output(left: &Path, right: &Path) -> bool {
-    left == right || ascii_case_fold_path(left) == ascii_case_fold_path(right)
+fn paths_overlap_for_token_output(left: &Path, right: &Path) -> bool {
+    path_components_overlap(left, right) || path_components_overlap(right, left)
 }
 
-fn ascii_case_fold_path(path: &Path) -> String {
-    path.as_os_str()
-        .to_string_lossy()
-        .chars()
-        .map(|ch| ch.to_ascii_lowercase())
+fn path_components_overlap(candidate: &Path, ancestor: &Path) -> bool {
+    let candidate = ascii_case_fold_path_components(candidate);
+    let ancestor = ascii_case_fold_path_components(ancestor);
+    candidate.starts_with(&ancestor)
+}
+
+fn ascii_case_fold_path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .chars()
+                .map(|ch| ch.to_ascii_lowercase())
+                .collect()
+        })
         .collect()
 }
 
@@ -2169,6 +2180,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nested_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-token.json");
+        let access = Path::new("/tmp/webex-headless-token.json/access-token");
+
+        let error = ensure_distinct_token_paths(token, Some(access)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn rejects_reverse_nested_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-access-token/token.json");
+        let access = Path::new("/tmp/webex-headless-access-token");
+
+        let error = ensure_distinct_token_paths(token, Some(access)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn accepts_paths_with_shared_string_prefix() {
+        ensure_distinct_token_paths(
+            Path::new("/tmp/webex-headless-token"),
+            Some(Path::new("/tmp/webex-headless-token-raw")),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn rejects_non_ascii_token_output_paths() {
         let token = Path::new("/tmp/webex-headless-tök.json");
         let access = Path::new("/tmp/webex-headless-access-token");
@@ -2217,6 +2265,35 @@ mod tests {
         let token = real_dir.join("token.json");
         let alias = alias_dir.join("token.json");
         let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+        std::fs::remove_file(&alias_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_nested_token_and_access_token_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "webex-headless-nested-symlink-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real_dir = base.join("real");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let token = real_dir.join("token.json");
+        let access = alias_dir.join("token.json").join("access-token");
+        let error = ensure_distinct_token_paths(&token, Some(&access)).unwrap_err();
 
         assert!(
             error
