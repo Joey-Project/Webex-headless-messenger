@@ -17,9 +17,8 @@ The example manages three pieces:
 The bundled receiver writes accepted events to journald as JSON Lines. For a real
 automation, replace that unit with your bot service or make your bot consume the
 receiver output. Keep the same forwarding token, loopback binding, health checks,
-and token-refresh timer. The bundled units intentionally run under one service
-user and shared env file; split users and env files before treating the receiver
-or a replacement bot as a lower-trust component.
+and token-refresh timer. The receiver uses a separate env file and does not need
+OAuth credentials or token-file access.
 
 ## Assumed Layout
 
@@ -27,6 +26,7 @@ or a replacement bot as a lower-trust component.
 /usr/local/bin/webex-headless
 /opt/webex-headless-messenger/examples/sidecar-js/index.mjs
 /etc/webex-headless/webex-headless.env
+/etc/webex-headless/webex-headless-receiver.env
 /var/lib/webex-headless/token.json
 ```
 
@@ -54,14 +54,19 @@ sudo install -d -o webex-headless -g webex-headless -m 0750 /var/lib/webex-headl
 sudo install -d -o root -g webex-headless -m 0750 /etc/webex-headless
 ```
 
-Install the env template, edit it, and keep it readable only by root and the
-service group:
+Install the env templates, edit them, and keep them readable only by root and
+the service group. Put OAuth credentials only in `webex-headless.env`; keep the
+receiver file limited to receiver settings and the local forwarding token:
 
 ```bash
 sudo install -o root -g webex-headless -m 0640 \
   deploy/systemd/webex-headless.env.example \
   /etc/webex-headless/webex-headless.env
+sudo install -o root -g webex-headless -m 0640 \
+  deploy/systemd/webex-headless-receiver.env.example \
+  /etc/webex-headless/webex-headless-receiver.env
 sudo editor /etc/webex-headless/webex-headless.env
+sudo editor /etc/webex-headless/webex-headless-receiver.env
 ```
 
 Install the units:
@@ -76,19 +81,23 @@ sudo systemctl daemon-reload
 ```
 
 Bootstrap the initial token file after setting the Integration credentials and
-scopes in the env file:
+scopes in `/etc/webex-headless/webex-headless.env`. Load that protected env file
+through a transient systemd service so the client secret is not placed on the
+command line:
 
 ```bash
-sudo -u webex-headless env \
-  WEBEX_CLIENT_ID='<client-id>' \
-  WEBEX_CLIENT_SECRET='<client-secret>' \
+sudo systemd-run --wait --collect --pty \
+  --uid=webex-headless \
+  --gid=webex-headless \
+  --property=EnvironmentFile=/etc/webex-headless/webex-headless.env \
   /usr/local/bin/webex-headless auth device \
     --token-file /var/lib/webex-headless/token.json \
     --scopes 'spark:all spark:kms'
 ```
 
-Start the stack. The JS sidecar refreshes the token cache before validating its
-config and listening, and the timer keeps the same token file fresh afterward:
+Start the stack. The JS sidecar makes a best-effort startup token refresh before
+validating its config and listening, uses the cached token if that refresh fails,
+and the timer keeps the same token file fresh afterward:
 
 ```bash
 sudo systemctl enable --now webex-headless-sidecar.target
@@ -116,7 +125,7 @@ journalctl -u webex-headless-token-refresh.service
 
 ## Operations Notes
 
-- Keep `WEBEX_SIDECAR_TOKEN` identical in the receiver and JS sidecar.
+- Keep `WEBEX_SIDECAR_TOKEN` identical in the receiver and JS sidecar env files.
 - Keep every bind and target URL on loopback unless another layer provides
   transport security and access control.
 - The token refresh timer does not add newly granted scopes to an old token.
@@ -127,6 +136,6 @@ journalctl -u webex-headless-token-refresh.service
 - If you replace the receiver with a bot service, update the target dependencies,
   the JS service `Requires=` line, and `WEBEX_SIDECAR_TARGET_URL`
   together.
-- If startup should accept a raw access-token file without OAuth refresh, remove
-  the JS service startup `auth refresh` step and provide a different token
-  freshness strategy.
+- The JS startup refresh is best-effort so a transient Webex or network outage
+  does not block startup when the cached token is still usable. The timer keeps
+  retrying refresh in the background.

@@ -11,19 +11,16 @@ StartLimitBurst=12
 Type=simple
 User=webex-headless
 Group=webex-headless
-EnvironmentFile=/etc/webex-headless/webex-headless.env
+EnvironmentFile=/etc/webex-headless/webex-headless-receiver.env
 ExecStart=/usr/local/bin/webex-headless sidecar receive --bind ${WEBEX_SIDECAR_RECEIVER_BIND} --path ${WEBEX_SIDECAR_RECEIVER_PATH} --health-path ${WEBEX_SIDECAR_RECEIVER_HEALTH_PATH}
 Restart=on-failure
 RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=20s
-StateDirectory=webex-headless
-StateDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/webex-headless
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
