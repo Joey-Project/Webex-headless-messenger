@@ -30,6 +30,7 @@ file access.
 /etc/webex-headless/webex-headless.env
 /etc/webex-headless/webex-headless-receiver.env
 /etc/webex-headless/webex-headless-token.env
+/etc/webex-headless/webex-client-secret
 /var/lib/webex-headless-token/token.json
 /var/lib/webex-headless-access/access-token
 ```
@@ -62,14 +63,15 @@ sudo useradd --system --gid webex-headless-token --home /var/lib/webex-headless-
 sudo install -d -o webex-headless-token -g webex-headless-token -m 0700 /var/lib/webex-headless-token
 sudo install -d -o webex-headless-token -g webex-headless-sidecar -m 2750 /var/lib/webex-headless-access
 sudo install -d -o root -g root -m 0750 /etc/webex-headless
+sudo install -o root -g webex-headless-token -m 0640 /dev/null /etc/webex-headless/webex-client-secret
 ```
 
-Install the env templates, edit them, and keep the files readable only by root.
-Systemd reads `EnvironmentFile=` entries before dropping to the service user, so
-the long-running processes do not need direct filesystem access to these files.
-Put OAuth credentials only in `webex-headless-token.env`; keep the JS sidecar
-and receiver files limited to their runtime settings and the local forwarding
-token:
+Install the env templates and keep them readable only by root. Put the OAuth
+client ID and secret file path in `webex-headless-token.env`, and put the secret
+value itself in `/etc/webex-headless/webex-client-secret`. The token-refresh
+identity can read that secret file, while the JS sidecar and receiver cannot.
+Keep the JS sidecar and receiver env files limited to their runtime settings and
+the local forwarding token:
 
 ```bash
 sudo install -o root -g root -m 0600 \
@@ -84,6 +86,7 @@ sudo install -o root -g root -m 0600 \
 sudo editor /etc/webex-headless/webex-headless.env
 sudo editor /etc/webex-headless/webex-headless-receiver.env
 sudo editor /etc/webex-headless/webex-headless-token.env
+sudo editor /etc/webex-headless/webex-client-secret
 ```
 
 Install the units:
@@ -97,10 +100,10 @@ sudo install -m 0644 deploy/systemd/webex-headless-token-refresh.timer /etc/syst
 sudo systemctl daemon-reload
 ```
 
-Bootstrap the initial token file after setting the Integration credentials and
-scopes in `/etc/webex-headless/webex-headless-token.env`. Load that protected env file
-through a transient systemd service so the client secret is not placed on the
-command line:
+Bootstrap the initial token file after setting the Integration client ID, secret
+file path, secret file contents, and scopes. Load the protected env file through a
+transient systemd service; the CLI reads the client secret from the secret file so
+the secret value is not placed on the command line or in the process environment:
 
 ```bash
 sudo systemd-run --wait --collect --pty \
@@ -149,6 +152,8 @@ journalctl -u webex-headless-token-refresh.service
 - Keep `WEBEX_ACCESS_TOKEN_FILE` identical in the JS sidecar and token-refresh env files.
 - Keep `WEBEX_REFRESH_TOKEN_FILE` private to the token-refresh env file; it stores
   the full refreshable `TokenSet` cache.
+- Keep `WEBEX_CLIENT_SECRET_FILE` private to the token-refresh env file, and keep
+  the referenced secret file readable only by root and `webex-headless-token`.
 - Keep every bind and target URL on loopback unless another layer provides
   transport security and access control.
 - Keep the env files root-only. The JS sidecar and receiver run under separate

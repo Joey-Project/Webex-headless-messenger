@@ -154,7 +154,7 @@ cargo run --bin webex-headless -- \
   --token-file /var/lib/webex-headless-token/token.json \
   --access-token-file /var/lib/webex-headless-access/access-token \
   --client-id "$WEBEX_CLIENT_ID" \
-  --client-secret "$WEBEX_CLIENT_SECRET"
+  --client-secret-file /etc/webex-headless/webex-client-secret
 ```
 
 The sidecar reads `WEBEX_ACCESS_TOKEN_FILE` or `WEBEX_TOKEN_FILE`. It accepts the

@@ -166,10 +166,10 @@ cargo run --bin webex-headless -- \
   auth device --token-file .codex-tmp/webex-token.json
 ```
 
-Use the token file for REST calls. When `WEBEX_CLIENT_ID` and
-`WEBEX_CLIENT_SECRET` are also set, the CLI refreshes expiring access tokens and
-updates the file. Token-file persistence is currently Unix-only and writes the
-file with owner-only `0600` permissions; on non-Unix platforms, use
+Use the token file for REST calls. When `WEBEX_CLIENT_ID` and either
+`WEBEX_CLIENT_SECRET` or `WEBEX_CLIENT_SECRET_FILE` are also set, the CLI
+refreshes expiring access tokens and updates the file. Token-file persistence is
+currently Unix-only and writes the file with owner-only `0600` permissions; on non-Unix platforms, use
 `--stdout-token` and store the JSON in platform secret storage.
 
 Long-running services can proactively refresh the same token cache with
@@ -183,7 +183,7 @@ cargo run --bin webex-headless -- \
   --token-file .codex-tmp/webex-token.json \
   --access-token-file .codex-tmp/webex-access-token \
   --client-id "$WEBEX_CLIENT_ID" \
-  --client-secret "$WEBEX_CLIENT_SECRET"
+  --client-secret-file /etc/webex-headless/webex-client-secret
 ```
 
 ```bash

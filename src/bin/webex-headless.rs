@@ -168,6 +168,7 @@ struct GlobalOptions {
     token_file: Option<PathBuf>,
     client_id: Option<String>,
     client_secret: Option<String>,
+    client_secret_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -193,6 +194,7 @@ enum Command {
 struct AuthDeviceArgs {
     client_id: Option<String>,
     client_secret: Option<String>,
+    client_secret_file: Option<PathBuf>,
     token_file: Option<PathBuf>,
     access_token_file: Option<PathBuf>,
     scopes: Vec<String>,
@@ -203,6 +205,7 @@ struct AuthDeviceArgs {
 struct AuthRefreshArgs {
     client_id: Option<String>,
     client_secret: Option<String>,
+    client_secret_file: Option<PathBuf>,
     token_file: Option<PathBuf>,
     access_token_file: Option<PathBuf>,
 }
@@ -329,6 +332,8 @@ impl Cli {
                 global.client_id = Some(value);
             } else if let Some(value) = cursor.take_option("--client-secret")? {
                 global.client_secret = Some(value);
+            } else if let Some(value) = cursor.take_option("--client-secret-file")? {
+                global.client_secret_file = Some(PathBuf::from(value));
             } else {
                 return Err(CliError(format!("unknown global option {arg:?}")).into());
             }
@@ -372,6 +377,8 @@ fn parse_auth_device(cursor: &mut ArgCursor) -> CliResult<Command> {
             args.client_id = Some(value);
         } else if let Some(value) = cursor.take_option("--client-secret")? {
             args.client_secret = Some(value);
+        } else if let Some(value) = cursor.take_option("--client-secret-file")? {
+            args.client_secret_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--token-file")? {
             args.token_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--access-token-file")? {
@@ -394,6 +401,8 @@ fn parse_auth_refresh(cursor: &mut ArgCursor) -> CliResult<Command> {
             args.client_id = Some(value);
         } else if let Some(value) = cursor.take_option("--client-secret")? {
             args.client_secret = Some(value);
+        } else if let Some(value) = cursor.take_option("--client-secret-file")? {
+            args.client_secret_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--token-file")? {
             args.token_file = Some(PathBuf::from(value));
         } else if let Some(value) = cursor.take_option("--access-token-file")? {
@@ -841,6 +850,40 @@ fn env_or_value(value: Option<String>, name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn env_or_path(value: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    value
+        .or_else(|| env::var(name).ok().map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+async fn resolve_client_secret(
+    value: Option<String>,
+    file: Option<PathBuf>,
+) -> CliResult<Option<String>> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(value));
+    }
+    if let Some(path) = file.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(Some(read_client_secret_file(&path).await?));
+    }
+    if let Some(value) = env_or_value(None, "WEBEX_CLIENT_SECRET") {
+        return Ok(Some(value));
+    }
+    if let Some(path) = env_or_path(None, "WEBEX_CLIENT_SECRET_FILE") {
+        return Ok(Some(read_client_secret_file(&path).await?));
+    }
+    Ok(None)
+}
+
+async fn read_client_secret_file(path: &Path) -> CliResult<String> {
+    let value = tokio::fs::read_to_string(path).await?;
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.trim().is_empty() {
+        return Err(CliError(format!("client secret file {} is empty", path.display())).into());
+    }
+    Ok(value)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AuthSource {
     AccessToken(String),
@@ -898,7 +941,11 @@ async fn build_token_file_client(
 ) -> CliResult<WebexClient> {
     let token_set = read_token_file(&token_file).await?;
     let client_id = env_or_value(global.client_id.clone(), "WEBEX_CLIENT_ID");
-    let client_secret = env_or_value(global.client_secret.clone(), "WEBEX_CLIENT_SECRET");
+    let client_secret = resolve_client_secret(
+        global.client_secret.clone(),
+        global.client_secret_file.clone(),
+    )
+    .await?;
 
     if let (Some(client_id), Some(client_secret), Some(_)) =
         (client_id, client_secret, token_set.refresh_token.as_ref())
@@ -933,11 +980,18 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
         "WEBEX_CLIENT_ID",
     )
     .ok_or_else(|| CliError("--client-id or WEBEX_CLIENT_ID is required".into()))?;
-    let client_secret = env_or_value(
+    let client_secret = resolve_client_secret(
         args.client_secret.or_else(|| global.client_secret.clone()),
-        "WEBEX_CLIENT_SECRET",
+        args.client_secret_file
+            .or_else(|| global.client_secret_file.clone()),
     )
-    .ok_or_else(|| CliError("--client-secret or WEBEX_CLIENT_SECRET is required".into()))?;
+    .await?
+    .ok_or_else(|| {
+        CliError(
+            "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
+                .into(),
+        )
+    })?;
 
     let oauth = OAuthClient::new(OAuthConfig::new(client_id)?.with_client_secret(client_secret));
     let mut refreshed = oauth.refresh_token(&refresh_token).await?;
@@ -969,11 +1023,18 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
         "WEBEX_CLIENT_ID",
     )
     .ok_or_else(|| CliError("--client-id or WEBEX_CLIENT_ID is required".into()))?;
-    let client_secret = env_or_value(
+    let client_secret = resolve_client_secret(
         args.client_secret.or_else(|| global.client_secret.clone()),
-        "WEBEX_CLIENT_SECRET",
+        args.client_secret_file
+            .or_else(|| global.client_secret_file.clone()),
     )
-    .ok_or_else(|| CliError("--client-secret or WEBEX_CLIENT_SECRET is required".into()))?;
+    .await?
+    .ok_or_else(|| {
+        CliError(
+            "--client-secret, --client-secret-file, WEBEX_CLIENT_SECRET, or WEBEX_CLIENT_SECRET_FILE is required"
+                .into(),
+        )
+    })?;
     let token_file = args
         .token_file
         .or_else(|| global.token_file.clone())
@@ -1756,10 +1817,11 @@ Global options:
   --token-file PATH          TokenSet JSON file. Env: WEBEX_TOKEN_FILE
   --client-id ID             Integration client ID. Env: WEBEX_CLIENT_ID
   --client-secret SECRET     Integration client secret. Env: WEBEX_CLIENT_SECRET
+  --client-secret-file PATH  File containing Integration client secret. Env: WEBEX_CLIENT_SECRET_FILE
 
 Commands:
-  auth device [--token-file PATH] [--access-token-file PATH] [--scopes LIST] [--scope S] [--stdout-token]
-  auth refresh [--token-file PATH] [--access-token-file PATH] [--client-id ID] [--client-secret SECRET]
+  auth device [--token-file PATH] [--access-token-file PATH] [--client-secret-file PATH] [--scopes LIST] [--scope S] [--stdout-token]
+  auth refresh [--token-file PATH] [--access-token-file PATH] [--client-id ID] [--client-secret SECRET] [--client-secret-file PATH]
   me
   rooms list [--max N] [--type group|direct] [--team-id ID] [--all]
   rooms get --room-id ID
@@ -1861,6 +1923,8 @@ mod tests {
             "token.json".to_owned(),
             "--access-token-file".to_owned(),
             "access-token".to_owned(),
+            "--client-secret-file".to_owned(),
+            "client-secret".to_owned(),
         ])
         .unwrap();
 
@@ -1869,10 +1933,32 @@ mod tests {
             Command::AuthRefresh(AuthRefreshArgs {
                 token_file: Some(path),
                 access_token_file: Some(access_token_path),
+                client_secret_file: Some(client_secret_path),
                 ..
             }) if path == Path::new("token.json")
                 && access_token_path == Path::new("access-token")
+                && client_secret_path == Path::new("client-secret")
         ));
+    }
+
+    #[tokio::test]
+    async fn reads_client_secret_file_without_trailing_newline() {
+        let path = std::env::temp_dir().join(format!(
+            "webex-headless-client-secret-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::write(&path, "secret-value\n").await.unwrap();
+
+        let secret = resolve_client_secret(None, Some(path.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(secret.as_deref(), Some("secret-value"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
