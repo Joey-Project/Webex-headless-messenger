@@ -25,6 +25,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+InaccessiblePaths=/etc/webex-headless/webex-headless-token.env
 ReadWritePaths=/var/lib/webex-headless
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 

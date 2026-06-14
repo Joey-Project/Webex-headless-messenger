@@ -53,22 +53,24 @@ Create a locked-down service user and directories:
 ```bash
 sudo useradd --system --home /var/lib/webex-headless --shell /usr/sbin/nologin webex-headless
 sudo install -d -o webex-headless -g webex-headless -m 0750 /var/lib/webex-headless
-sudo install -d -o root -g webex-headless -m 0750 /etc/webex-headless
+sudo install -d -o root -g root -m 0750 /etc/webex-headless
 ```
 
-Install the env templates, edit them, and keep them readable only by root and
-the service group. Put OAuth credentials only in `webex-headless-token.env`;
-keep the JS sidecar and receiver files limited to their runtime settings and the
-local forwarding token:
+Install the env templates, edit them, and keep the files readable only by root.
+Systemd reads `EnvironmentFile=` entries before dropping to the service user, so
+the long-running processes do not need direct filesystem access to these files.
+Put OAuth credentials only in `webex-headless-token.env`; keep the JS sidecar
+and receiver files limited to their runtime settings and the local forwarding
+token:
 
 ```bash
-sudo install -o root -g webex-headless -m 0640 \
+sudo install -o root -g root -m 0600 \
   deploy/systemd/webex-headless.env.example \
   /etc/webex-headless/webex-headless.env
-sudo install -o root -g webex-headless -m 0640 \
+sudo install -o root -g root -m 0600 \
   deploy/systemd/webex-headless-receiver.env.example \
   /etc/webex-headless/webex-headless-receiver.env
-sudo install -o root -g webex-headless -m 0640 \
+sudo install -o root -g root -m 0600 \
   deploy/systemd/webex-headless-token.env.example \
   /etc/webex-headless/webex-headless-token.env
 sudo editor /etc/webex-headless/webex-headless.env
@@ -136,6 +138,9 @@ journalctl -u webex-headless-token-refresh.service
 - Keep `WEBEX_TOKEN_FILE` identical in the JS sidecar and token-refresh env files.
 - Keep every bind and target URL on loopback unless another layer provides
   transport security and access control.
+- Keep the env files root-only. The JS sidecar and receiver units make
+  `webex-headless-token.env` inaccessible, and the receiver unit also makes the
+  OAuth token cache inaccessible.
 - The token refresh timer does not add newly granted scopes to an old token.
   Re-run Device Grant Flow after changing Integration permissions.
 - The JS sidecar exits when forwarding retries are exhausted. Systemd restarts
