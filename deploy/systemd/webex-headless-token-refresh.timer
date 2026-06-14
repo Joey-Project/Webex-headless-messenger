@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh Webex Headless OAuth token cache periodically
+PartOf=webex-headless-sidecar.target
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=45m
+RandomizedDelaySec=5m
+Persistent=true
+Unit=webex-headless-token-refresh.service
+
+[Install]
+WantedBy=timers.target
+WantedBy=webex-headless-sidecar.target

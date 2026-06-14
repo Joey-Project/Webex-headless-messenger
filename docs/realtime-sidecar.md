@@ -188,6 +188,9 @@ curl -fsS http://127.0.0.1:8788/readyz
 curl -fsS http://127.0.0.1:8788/livez
 ```
 
+Linux systemd templates for the receiver, JS sidecar, and token refresh timer
+are available in [`deploy/systemd`](../deploy/systemd).
+
 ## Reliability Model
 
 - Forwarding uses bounded concurrency and retries transient receiver/network

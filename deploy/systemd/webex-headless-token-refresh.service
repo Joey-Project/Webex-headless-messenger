@@ -1,0 +1,20 @@
+[Unit]
+Description=Refresh Webex Headless OAuth token cache
+Documentation=https://github.com/Joey-Project/Webex-headless-messenger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=webex-headless
+Group=webex-headless
+EnvironmentFile=/etc/webex-headless/webex-headless.env
+ExecStart=/usr/local/bin/webex-headless auth refresh --token-file ${WEBEX_TOKEN_FILE}
+StateDirectory=webex-headless
+ConfigurationDirectory=webex-headless
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/webex-headless
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
