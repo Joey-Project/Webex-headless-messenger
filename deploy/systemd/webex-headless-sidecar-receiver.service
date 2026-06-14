@@ -1,0 +1,30 @@
+[Unit]
+Description=Webex Headless sidecar receiver
+Documentation=https://github.com/Joey-Project/Webex-headless-messenger
+After=network-online.target
+Wants=network-online.target
+PartOf=webex-headless-sidecar.target
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=webex-headless-receiver
+Group=webex-headless-receiver
+EnvironmentFile=/etc/webex-headless/webex-headless-receiver.env
+ExecStart=/usr/local/bin/webex-headless sidecar receive --bind ${WEBEX_SIDECAR_RECEIVER_BIND} --path ${WEBEX_SIDECAR_RECEIVER_PATH} --health-path ${WEBEX_SIDECAR_RECEIVER_HEALTH_PATH}
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+InaccessiblePaths=/etc/webex-headless/webex-headless-token.env
+InaccessiblePaths=/var/lib/webex-headless-token
+InaccessiblePaths=/var/lib/webex-headless-access
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=webex-headless-sidecar.target

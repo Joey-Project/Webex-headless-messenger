@@ -2,10 +2,10 @@
 
 ## Current State
 - 仓库已从 review-gate 模板切换为 `webex-headless-messenger` Rust library crate。
-- 首个 crate bootstrap slice 已完成；smoke docs、简单文件上传 helper、JS SDK realtime sidecar demo、thin CLI、production sidecar MVP 已完成；cards 仍按需评估。
+- 首个 crate bootstrap slice 已完成；smoke docs、简单文件上传 helper、JS SDK realtime sidecar demo、thin CLI、production sidecar MVP、systemd supervisor templates 已完成；cards 仍按需评估。
 
 ## Recovery Pointers
-- Latest completed workstream: `docs/project_journal/2026/06/2026-06-12-production-sidecar.md`
+- Latest completed workstream: `docs/project_journal/2026/06/2026-06-14-sidecar-systemd-supervisor.md`
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers

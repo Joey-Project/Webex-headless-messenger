@@ -1,0 +1,10 @@
+[Unit]
+Description=Webex Headless realtime sidecar stack
+Wants=network-online.target
+Wants=webex-headless-sidecar-receiver.service
+Wants=webex-headless-sidecar-js.service
+Wants=webex-headless-token-refresh.timer
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

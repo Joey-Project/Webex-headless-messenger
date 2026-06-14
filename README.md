@@ -166,21 +166,31 @@ cargo run --bin webex-headless -- \
   auth device --token-file .codex-tmp/webex-token.json
 ```
 
-Use the token file for REST calls. When `WEBEX_CLIENT_ID` and
-`WEBEX_CLIENT_SECRET` are also set, the CLI refreshes expiring access tokens and
-updates the file. Token-file persistence is currently Unix-only and writes the
-file with owner-only `0600` permissions; on non-Unix platforms, use
+Use the token file for REST calls. When `WEBEX_CLIENT_ID` and either
+`WEBEX_CLIENT_SECRET` or `WEBEX_CLIENT_SECRET_FILE` are also set, the CLI
+refreshes expiring access tokens and updates the file. Token-file persistence is
+currently Unix-only and writes the file with owner-only `0600` permissions; on non-Unix platforms, use
 `--stdout-token` and store the JSON in platform secret storage.
 
 Long-running services can proactively refresh the same token cache with
-`auth refresh`, for example from a systemd timer or cron job:
+`auth refresh`, for example from a systemd timer or cron job. Use
+`--access-token-file` when another process should read only the raw access token.
+The access-token file is written as raw token text with owner-only `0600`
+permissions by default. If a separate Unix identity must read that raw token,
+pass `--access-token-file-group-readable` and publish it inside a dedicated
+group-readable directory. When both `--token-file` and `--access-token-file` are
+set, both output paths must be ASCII so the CLI can conservatively reject
+case-insensitive filesystem aliases and nested path overlaps before writing
+either file:
 
 ```bash
 cargo run --bin webex-headless -- \
   auth refresh \
   --token-file .codex-tmp/webex-token.json \
+  --access-token-file .codex-tmp/webex-access-token \
+  --access-token-file-group-readable \
   --client-id "$WEBEX_CLIENT_ID" \
-  --client-secret "$WEBEX_CLIENT_SECRET"
+  --client-secret-file /etc/webex-headless/webex-client-secret
 ```
 
 ```bash
@@ -299,7 +309,8 @@ WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
 See [docs/realtime-sidecar.md](docs/realtime-sidecar.md) for live Webex setup,
 required realtime scopes (`spark:all` plus `spark:kms`), forwarding-token
 configuration, token refresh/reload, health checks, loopback restrictions, and
-security notes.
+security notes. See [deploy/systemd](deploy/systemd) for Linux supervisor
+templates.
 
 ## Smoke Test
 
