@@ -164,4 +164,5 @@ journalctl -u webex-headless-token-refresh.service
   `WEBEX_SIDECAR_TARGET_URL` together.
 - The JS startup refresh is best-effort through `Wants=` / `After=` on the
   token-refresh service. `TimeoutStartSec=45s` bounds startup delay when Webex or
-  the network hangs, and the timer keeps retrying refresh in the background.
+  the network hangs. If systemd kills a refresh after Webex has rotated the
+  refresh token but before the local cache is saved, re-run Device Grant Flow.

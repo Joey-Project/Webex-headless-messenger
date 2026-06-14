@@ -5,7 +5,7 @@ use std::{
     fmt,
     io::Write as _,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -922,6 +922,7 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
         .or_else(|| global.token_file.clone())
         .or_else(|| env::var("WEBEX_TOKEN_FILE").ok().map(PathBuf::from))
         .ok_or_else(|| CliError("auth refresh requires --token-file or WEBEX_TOKEN_FILE".into()))?;
+    ensure_distinct_token_paths(&token_file, access_token_file.as_deref())?;
     let current = read_token_file(&token_file).await?;
     let refresh_token = current
         .refresh_token
@@ -944,7 +945,6 @@ async fn auth_refresh(global: &GlobalOptions, args: AuthRefreshArgs) -> CliResul
         refreshed.refresh_token = Some(refresh_token);
         refreshed.refresh_token_expires_at = current.refresh_token_expires_at;
     }
-    ensure_distinct_token_paths(&token_file, access_token_file.as_deref())?;
     save_token_file(&token_file, &refreshed).await?;
     if let Some(path) = access_token_file.as_deref() {
         save_access_token_file(path, &refreshed.access_token).await?;
@@ -983,6 +983,9 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
             "auth device requires --token-file/WEBEX_TOKEN_FILE or --stdout-token".into(),
         )
         .into());
+    }
+    if let Some(path) = token_file.as_deref() {
+        ensure_distinct_token_paths(path, access_token_file.as_deref())?;
     }
 
     let scopes = if args.scopes.is_empty() {
@@ -1025,7 +1028,6 @@ async fn auth_device(global: &GlobalOptions, args: AuthDeviceArgs) -> CliResult<
     };
 
     if let Some(path) = token_file.as_deref() {
-        ensure_distinct_token_paths(path, access_token_file.as_deref())?;
         save_token_file(path, &token).await?;
     }
     if let Some(path) = access_token_file.as_deref() {
@@ -1077,10 +1079,36 @@ fn ensure_distinct_token_paths(
     token_file: &Path,
     access_token_file: Option<&Path>,
 ) -> CliResult<()> {
-    if access_token_file.is_some_and(|path| path == token_file) {
+    let Some(access_token_file) = access_token_file else {
+        return Ok(());
+    };
+    if lexical_absolute_path(token_file)? == lexical_absolute_path(access_token_file)? {
         return Err(CliError("--token-file and --access-token-file must differ".into()).into());
     }
     Ok(())
+}
+
+fn lexical_absolute_path(path: &Path) -> CliResult<PathBuf> {
+    let base = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        env::current_dir()?
+    };
+    let mut normalized = base;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
 }
 
 async fn read_token_file(path: &Path) -> CliResult<TokenSet> {
@@ -1777,6 +1805,22 @@ mod tests {
         let error =
             ensure_distinct_token_paths(Path::new("token.json"), Some(Path::new("token.json")))
                 .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn rejects_lexically_equivalent_token_and_access_token_paths() {
+        let base =
+            std::env::temp_dir().join(format!("webex-headless-path-test-{}", std::process::id()));
+        let token = base.join("token.json");
+        let alias = base.join("nested").join("..").join("token.json");
+
+        let error = ensure_distinct_token_paths(&token, Some(&alias)).unwrap_err();
 
         assert!(
             error
