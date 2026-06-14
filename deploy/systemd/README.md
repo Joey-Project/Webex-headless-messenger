@@ -17,9 +17,10 @@ The example manages three pieces:
 The bundled receiver writes accepted events to journald as JSON Lines. For a real
 automation, replace that unit with your bot service or make your bot consume the
 receiver output. Keep the same forwarding token, loopback binding, health checks,
-and token-refresh timer. OAuth credentials are isolated to the token-refresh
-env file; the receiver and JS sidecar use separate env files without the client
-secret.
+and token-refresh timer. OAuth credentials and the refresh-token cache stay
+under the token-refresh identity. The token-refresh service publishes a separate
+raw access-token file for the JS sidecar, and the receiver runs under an identity with no OAuth token
+file access.
 
 ## Assumed Layout
 
@@ -29,7 +30,8 @@ secret.
 /etc/webex-headless/webex-headless.env
 /etc/webex-headless/webex-headless-receiver.env
 /etc/webex-headless/webex-headless-token.env
-/var/lib/webex-headless/token.json
+/var/lib/webex-headless-token/token.json
+/var/lib/webex-headless-access/access-token
 ```
 
 ## Install
@@ -48,11 +50,17 @@ cd /opt/webex-headless-messenger/examples/sidecar-js
 npm ci --omit=dev
 ```
 
-Create a locked-down service user and directories:
+Create locked-down service users and directories:
 
 ```bash
-sudo useradd --system --home /var/lib/webex-headless --shell /usr/sbin/nologin webex-headless
-sudo install -d -o webex-headless -g webex-headless -m 0750 /var/lib/webex-headless
+sudo groupadd --system webex-headless-sidecar
+sudo groupadd --system webex-headless-receiver
+sudo groupadd --system webex-headless-token
+sudo useradd --system --gid webex-headless-sidecar --home /var/lib/webex-headless-access --shell /usr/sbin/nologin webex-headless-sidecar
+sudo useradd --system --gid webex-headless-receiver --home /nonexistent --shell /usr/sbin/nologin webex-headless-receiver
+sudo useradd --system --gid webex-headless-token --home /var/lib/webex-headless-token --shell /usr/sbin/nologin webex-headless-token
+sudo install -d -o webex-headless-token -g webex-headless-token -m 0700 /var/lib/webex-headless-token
+sudo install -d -o webex-headless-token -g webex-headless-sidecar -m 2750 /var/lib/webex-headless-access
 sudo install -d -o root -g root -m 0750 /etc/webex-headless
 ```
 
@@ -96,17 +104,20 @@ command line:
 
 ```bash
 sudo systemd-run --wait --collect --pty \
-  --uid=webex-headless \
-  --gid=webex-headless \
+  --uid=webex-headless-token \
+  --gid=webex-headless-token \
   --property=EnvironmentFile=/etc/webex-headless/webex-headless-token.env \
   /usr/local/bin/webex-headless auth device \
-    --token-file /var/lib/webex-headless/token.json \
+    --token-file /var/lib/webex-headless-token/token.json \
+    --access-token-file /var/lib/webex-headless-access/access-token \
     --scopes 'spark:all spark:kms'
 ```
 
 Start the stack. The JS sidecar starts after a best-effort token refresh service
-run, uses the cached token if that refresh fails, and the timer keeps the same
-token file fresh afterward:
+run. That refresh keeps the private TokenSet cache current and publishes the
+raw access-token file consumed by the JS sidecar; if refresh fails or times out,
+the sidecar uses the access token initially published by Device Grant or the
+last token published by a later refresh:
 
 ```bash
 sudo systemctl enable --now webex-headless-sidecar.target
@@ -135,12 +146,14 @@ journalctl -u webex-headless-token-refresh.service
 ## Operations Notes
 
 - Keep `WEBEX_SIDECAR_TOKEN` identical in the receiver and JS sidecar env files.
-- Keep `WEBEX_TOKEN_FILE` identical in the JS sidecar and token-refresh env files.
+- Keep `WEBEX_ACCESS_TOKEN_FILE` identical in the JS sidecar and token-refresh env files.
+- Keep `WEBEX_REFRESH_TOKEN_FILE` private to the token-refresh env file; it stores
+  the full refreshable `TokenSet` cache.
 - Keep every bind and target URL on loopback unless another layer provides
   transport security and access control.
-- Keep the env files root-only. The JS sidecar and receiver units make
-  `webex-headless-token.env` inaccessible, and the receiver unit also makes the
-  OAuth token cache inaccessible.
+- Keep the env files root-only. The JS sidecar and receiver run under separate
+  Unix identities from token refresh, and their units make the private token
+  paths inaccessible.
 - The token refresh timer does not add newly granted scopes to an old token.
   Re-run Device Grant Flow after changing Integration permissions.
 - The JS sidecar exits when forwarding retries are exhausted. Systemd restarts
@@ -150,6 +163,5 @@ journalctl -u webex-headless-token-refresh.service
   the JS service `Requires=` and `After=` lines, and
   `WEBEX_SIDECAR_TARGET_URL` together.
 - The JS startup refresh is best-effort through `Wants=` / `After=` on the
-  token-refresh service, so a transient Webex or network outage does not block
-  startup when the cached token is still usable. The timer keeps retrying
-  refresh in the background.
+  token-refresh service. `TimeoutStartSec=45s` bounds startup delay when Webex or
+  the network hangs, and the timer keeps retrying refresh in the background.

@@ -173,12 +173,15 @@ file with owner-only `0600` permissions; on non-Unix platforms, use
 `--stdout-token` and store the JSON in platform secret storage.
 
 Long-running services can proactively refresh the same token cache with
-`auth refresh`, for example from a systemd timer or cron job:
+`auth refresh`, for example from a systemd timer or cron job. Use
+`--access-token-file` when another process should read only the raw access token.
+The access-token file is written as raw token text with mode `0640`:
 
 ```bash
 cargo run --bin webex-headless -- \
   auth refresh \
   --token-file .codex-tmp/webex-token.json \
+  --access-token-file .codex-tmp/webex-access-token \
   --client-id "$WEBEX_CLIENT_ID" \
   --client-secret "$WEBEX_CLIENT_SECRET"
 ```

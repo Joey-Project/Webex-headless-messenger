@@ -99,12 +99,14 @@ cargo run --bin webex-headless -- \
   --health-path /healthz
 ```
 
-Start the JS SDK sidecar with either a raw access token or the refreshable token
-file produced by `webex-headless auth device`:
+Start the JS SDK sidecar with a raw access-token file published by
+`webex-headless auth device --access-token-file` or `auth refresh --access-token-file`.
+For local testing, `WEBEX_TOKEN_FILE` can still point at a refreshable `TokenSet`
+JSON file:
 
 ```bash
 cd examples/sidecar-js
-WEBEX_TOKEN_FILE=/var/lib/webex-headless/token.json \
+WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token \
 WEBEX_SIDECAR_TOKEN=<same-forwarding-token> \
 WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
 WEBEX_SIDECAR_HEALTH_BIND=127.0.0.1:8788 \
@@ -121,7 +123,8 @@ with the CLI scope override:
 ```bash
 cargo run --bin webex-headless -- \
   auth device \
-  --token-file /var/lib/webex-headless/token.json \
+  --token-file /var/lib/webex-headless-token/token.json \
+  --access-token-file /var/lib/webex-headless-access/access-token \
   --scopes "spark:all spark:kms"
 ```
 
@@ -139,20 +142,22 @@ manager:
 2. JS sidecar process: runs `messages.listen()`, forwards events locally, reloads
    the access token file when it changes, and exits after unrecoverable forward
    failures so the supervisor can restart it.
-3. Token refresh process: keeps the shared token file fresh before access-token
-   expiry.
+3. Token refresh process: keeps the private refresh-token cache fresh and
+   publishes the raw access-token file consumed by the JS sidecar.
 
-Refresh the same token cache proactively with the CLI:
+Refresh the same token cache proactively with the CLI, and optionally publish a
+raw access-token file for the JS sidecar:
 
 ```bash
 cargo run --bin webex-headless -- \
   auth refresh \
-  --token-file /var/lib/webex-headless/token.json \
+  --token-file /var/lib/webex-headless-token/token.json \
+  --access-token-file /var/lib/webex-headless-access/access-token \
   --client-id "$WEBEX_CLIENT_ID" \
   --client-secret "$WEBEX_CLIENT_SECRET"
 ```
 
-The sidecar reads `WEBEX_TOKEN_FILE` or `WEBEX_ACCESS_TOKEN_FILE`. It accepts the
+The sidecar reads `WEBEX_ACCESS_TOKEN_FILE` or `WEBEX_TOKEN_FILE`. It accepts the
 crate's `TokenSet` JSON (`accessToken`) and raw-token files. When the file token
 changes, the sidecar starts a new Webex listener with the new token and then
 stops the old listener. A short overlap can produce duplicate events; the bot
@@ -161,7 +166,7 @@ must de-duplicate by message ID.
 Useful service environment knobs:
 
 ```text
-WEBEX_TOKEN_FILE=/var/lib/webex-headless/token.json
+WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token
 WEBEX_SIDECAR_TOKEN=<local-forwarding-token>
 WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events
 WEBEX_SIDECAR_TOKEN_RELOAD_INTERVAL_MS=60000
@@ -174,7 +179,7 @@ WEBEX_SIDECAR_HEALTH_BIND=127.0.0.1:8788
 Validate sidecar config without loading the Webex SDK. This check also requires `WEBEX_SIDECAR_TOKEN` unless `WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED=1` is explicitly set for local unsafe testing:
 
 ```bash
-WEBEX_TOKEN_FILE=/var/lib/webex-headless/token.json \
+WEBEX_ACCESS_TOKEN_FILE=/var/lib/webex-headless-access/access-token \
 WEBEX_SIDECAR_TOKEN=<local-forwarding-token> \
 WEBEX_SIDECAR_VALIDATE_CONFIG=1 \
 node examples/sidecar-js/index.mjs

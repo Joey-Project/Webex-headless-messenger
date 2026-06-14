@@ -9,8 +9,8 @@ StartLimitBurst=12
 
 [Service]
 Type=simple
-User=webex-headless
-Group=webex-headless
+User=webex-headless-receiver
+Group=webex-headless-receiver
 EnvironmentFile=/etc/webex-headless/webex-headless-receiver.env
 ExecStart=/usr/local/bin/webex-headless sidecar receive --bind ${WEBEX_SIDECAR_RECEIVER_BIND} --path ${WEBEX_SIDECAR_RECEIVER_PATH} --health-path ${WEBEX_SIDECAR_RECEIVER_HEALTH_PATH}
 Restart=on-failure
@@ -22,7 +22,8 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 InaccessiblePaths=/etc/webex-headless/webex-headless-token.env
-InaccessiblePaths=/var/lib/webex-headless/token.json
+InaccessiblePaths=/var/lib/webex-headless-token
+InaccessiblePaths=/var/lib/webex-headless-access
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
