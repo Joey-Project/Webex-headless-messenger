@@ -62,16 +62,19 @@ sudo useradd --system --gid webex-headless-receiver --home /nonexistent --shell 
 sudo useradd --system --gid webex-headless-token --home /var/lib/webex-headless-token --shell /usr/sbin/nologin webex-headless-token
 sudo install -d -o webex-headless-token -g webex-headless-token -m 0700 /var/lib/webex-headless-token
 sudo install -d -o webex-headless-token -g webex-headless-sidecar -m 2750 /var/lib/webex-headless-access
-sudo install -d -o root -g root -m 0750 /etc/webex-headless
+sudo install -d -o root -g webex-headless-token -m 0750 /etc/webex-headless
 sudo install -o root -g webex-headless-token -m 0640 /dev/null /etc/webex-headless/webex-client-secret
 ```
 
-Install the env templates and keep them readable only by root. Put the OAuth
-client ID and secret file path in `webex-headless-token.env`, and put the secret
-value itself in `/etc/webex-headless/webex-client-secret`. The token-refresh
-identity can read that secret file, while the JS sidecar and receiver cannot.
-Keep the JS sidecar and receiver env files limited to their runtime settings and
-the local forwarding token:
+Install the env templates and keep them readable only by root. The
+`/etc/webex-headless` directory is group-traversable by `webex-headless-token` so
+the token-refresh process can open the separate client-secret file, but the env
+files remain `root:root 0600`. Put the OAuth client ID and secret file path in
+`webex-headless-token.env`, and put the secret value itself in
+`/etc/webex-headless/webex-client-secret`. The token-refresh identity can read
+that secret file, while the JS sidecar and receiver cannot. Keep the JS sidecar
+and receiver env files limited to their runtime settings and the local
+forwarding token:
 
 ```bash
 sudo install -o root -g root -m 0600 \
@@ -102,8 +105,10 @@ sudo systemctl daemon-reload
 
 Bootstrap the initial token file after setting the Integration client ID, secret
 file path, secret file contents, and scopes. Load the protected env file through a
-transient systemd service; the CLI reads the client secret from the secret file so
-the secret value is not placed on the command line or in the process environment:
+transient systemd service, and pass `--client-secret-file` explicitly so legacy
+`WEBEX_CLIENT_SECRET` values left in the env file cannot take precedence. The CLI
+reads the client secret from the secret file so the secret value is not placed on
+the command line or in the process environment:
 
 ```bash
 sudo systemd-run --wait --collect --pty \
@@ -111,6 +116,7 @@ sudo systemd-run --wait --collect --pty \
   --gid=webex-headless-token \
   --property=EnvironmentFile=/etc/webex-headless/webex-headless-token.env \
   /usr/local/bin/webex-headless auth device \
+    --client-secret-file /etc/webex-headless/webex-client-secret \
     --token-file /var/lib/webex-headless-token/token.json \
     --access-token-file /var/lib/webex-headless-access/access-token \
     --scopes 'spark:all spark:kms'
@@ -153,7 +159,8 @@ journalctl -u webex-headless-token-refresh.service
 - Keep `WEBEX_REFRESH_TOKEN_FILE` private to the token-refresh env file; it stores
   the full refreshable `TokenSet` cache.
 - Keep `WEBEX_CLIENT_SECRET_FILE` private to the token-refresh env file, and keep
-  the referenced secret file readable only by root and `webex-headless-token`.
+  the referenced secret file readable only by root and `webex-headless-token`;
+  the parent directory must also be traversable by `webex-headless-token`.
 - Keep every bind and target URL on loopback unless another layer provides
   transport security and access control.
 - Keep the env files root-only. The JS sidecar and receiver run under separate

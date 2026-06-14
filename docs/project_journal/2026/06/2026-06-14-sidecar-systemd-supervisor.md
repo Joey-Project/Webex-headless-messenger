@@ -21,7 +21,9 @@ superseded_by:
 - Added deployment docs with install, token bootstrap, start, health check, and
   log inspection commands.
 - Token refresh uses a client-secret file path instead of placing the secret
-  value in the systemd environment.
+  value in the systemd environment; deployment docs keep the parent config
+  directory traversable by the token-refresh identity and bootstrap passes the
+  secret file explicitly.
 
 ## Current State
 - The repo now has a concrete Linux supervisor example under `deploy/systemd/`.

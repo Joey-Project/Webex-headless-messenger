@@ -1143,8 +1143,10 @@ fn ensure_distinct_token_paths(
     let Some(access_token_file) = access_token_file else {
         return Ok(());
     };
-    if lexical_absolute_path(token_file)? == lexical_absolute_path(access_token_file)?
-        || canonical_parent_paths_match(token_file, access_token_file)?
+    if paths_equivalent_for_token_output(
+        &lexical_absolute_path(token_file)?,
+        &lexical_absolute_path(access_token_file)?,
+    ) || canonical_parent_paths_match(token_file, access_token_file)?
     {
         return Err(CliError("--token-file and --access-token-file must differ".into()).into());
     }
@@ -1190,8 +1192,16 @@ fn canonical_parent_paths_match(left: &Path, right: &Path) -> CliResult<bool> {
             canonical_existing_ancestor_path(left)?,
             canonical_existing_ancestor_path(right)?
         ),
-        (Some(left), Some(right)) if left == right
+        (Some(left), Some(right)) if paths_equivalent_for_token_output(&left, &right)
     ))
+}
+
+fn paths_equivalent_for_token_output(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
 fn canonical_existing_ancestor_path(path: &Path) -> CliResult<Option<PathBuf>> {
@@ -1995,6 +2005,20 @@ mod tests {
     fn rejects_root_parent_equivalent_token_and_access_token_paths() {
         let token = Path::new("/tmp/webex-headless-token.json");
         let alias = Path::new("/../tmp/webex-headless-token.json");
+
+        let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token-file and --access-token-file must differ")
+        );
+    }
+
+    #[test]
+    fn rejects_case_only_token_and_access_token_paths() {
+        let token = Path::new("/tmp/webex-headless-token.json");
+        let alias = Path::new("/tmp/WEBEX-HEADLESS-TOKEN.JSON");
 
         let error = ensure_distinct_token_paths(token, Some(alias)).unwrap_err();
 
