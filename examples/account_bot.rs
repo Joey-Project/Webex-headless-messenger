@@ -668,11 +668,7 @@ impl AccountBot {
                     return Err(Error::Other("max events reached".to_owned()).into());
                 }
                 BeginInFlight::Processed => {
-                    return Ok(BotAction::ignored(
-                        "duplicate_message",
-                        Some(message_id),
-                        message.room_id.clone(),
-                    ));
+                    return self.duplicate_message_action(message_id, message.room_id.clone());
                 }
                 BeginInFlight::InProgress => {
                     match self.wait_for_in_flight_attempt(&message_id).await? {
@@ -688,11 +684,8 @@ impl AccountBot {
                             return Err(Error::Other("max events reached".to_owned()).into());
                         }
                         BeginInFlight::Processed => {
-                            return Ok(BotAction::ignored(
-                                "duplicate_message",
-                                Some(message_id),
-                                message.room_id.clone(),
-                            ));
+                            return self
+                                .duplicate_message_action(message_id, message.room_id.clone());
                         }
                         BeginInFlight::InProgress => {
                             return Err(BotError::retry_after(
@@ -813,7 +806,7 @@ impl AccountBot {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
-        match self
+        let outcome = self
             .send_reply(
                 inflight,
                 message_id.clone(),
@@ -823,15 +816,10 @@ impl AccountBot {
                 event_permit,
                 event_slot,
             )
-            .await?
-        {
-            ReplyOutcome::Replied(reply_id) => Ok(BotAction::replied(
-                message_id, room_id, reply_text, reply_id,
-            )),
-            ReplyOutcome::Ignored(reason) => {
-                Ok(BotAction::ignored(reason, Some(message_id), Some(room_id)))
-            }
-        }
+            .await?;
+        Ok(BotAction::from_reply_outcome(
+            message_id, room_id, reply_text, outcome,
+        ))
     }
 
     fn try_acquire_event_slot(&self) -> Option<EventSlot> {
@@ -870,6 +858,25 @@ impl AccountBot {
         )
     }
 
+    fn duplicate_message_action(
+        &self,
+        message_id: String,
+        room_id: Option<String>,
+    ) -> BotResult<BotAction> {
+        if let Some(event_slot) = self.try_acquire_event_slot() {
+            event_slot.commit();
+            return Ok(BotAction::ignored(
+                "duplicate_message",
+                Some(message_id),
+                room_id,
+            ));
+        }
+        Err(BotError::retry_after(
+            "max events reached".to_owned(),
+            retry_after_for_lease(self.config.in_flight_wait),
+        ))
+    }
+
     async fn send_reply(
         &self,
         inflight: InFlightMessage,
@@ -887,6 +894,9 @@ impl AccountBot {
             .clone();
         let state_persist_failed = self.state_persist_failed.clone();
         let attempt_lease = self.config.attempt_lease;
+        let log_message_id = message_id.clone();
+        let log_room_id = room_id.clone();
+        let log_reply_text = reply_text.clone();
         let (result_sender, result_receiver) = oneshot::channel();
         tokio::spawn(async move {
             let result = send_reply_worker(
@@ -902,7 +912,13 @@ impl AccountBot {
                 event_slot,
             )
             .await;
-            let _ = result_sender.send(result);
+            let _ = deliver_reply_result_or_log(
+                result_sender,
+                result,
+                log_message_id,
+                log_room_id,
+                log_reply_text,
+            );
         });
         let result = result_receiver.await.map_err(|error| {
             self.state_persist_failed.store(true, Ordering::Relaxed);
@@ -1146,6 +1162,25 @@ async fn send_reply_worker(
 
 type BotResult<T> = std::result::Result<T, BotError>;
 
+fn deliver_reply_result_or_log(
+    result_sender: oneshot::Sender<BotResult<ReplyOutcome>>,
+    result: BotResult<ReplyOutcome>,
+    message_id: String,
+    room_id: String,
+    reply_text: String,
+) -> bool {
+    match result_sender.send(result) {
+        Ok(()) => false,
+        Err(Ok(outcome)) => {
+            log_action_json(BotAction::from_reply_outcome(
+                message_id, room_id, reply_text, outcome,
+            ));
+            true
+        }
+        Err(Err(_)) => false,
+    }
+}
+
 #[derive(Debug)]
 enum ReplyOutcome {
     Replied(Option<String>),
@@ -1293,6 +1328,20 @@ impl BotAction {
             room_id: Some(room_id),
             reply_id,
             reply_text: Some(reply_text),
+        }
+    }
+
+    fn from_reply_outcome(
+        message_id: String,
+        room_id: String,
+        reply_text: String,
+        outcome: ReplyOutcome,
+    ) -> Self {
+        match outcome {
+            ReplyOutcome::Replied(reply_id) => {
+                Self::replied(message_id, room_id, reply_text, reply_id)
+            }
+            ReplyOutcome::Ignored(reason) => Self::ignored(reason, Some(message_id), Some(room_id)),
         }
     }
 
@@ -3781,10 +3830,10 @@ mod tests {
         assert!(duplicate_response.contains("duplicate_message"));
         let second_duplicate_response = send_event_request(address, "message-3").await;
         assert!(
-            second_duplicate_response.starts_with("HTTP/1.1 200 OK"),
+            second_duplicate_response.starts_with("HTTP/1.1 503 Service Unavailable"),
             "{second_duplicate_response}"
         );
-        assert!(second_duplicate_response.contains("duplicate_message"));
+        assert!(second_duplicate_response.contains("max events reached"));
         let extra_response = send_event_request(address, "message-4").await;
         assert!(
             extra_response.starts_with("HTTP/1.1 503 Service Unavailable"),
@@ -3808,7 +3857,8 @@ mod tests {
             .unwrap()
             .unwrap();
         webex_server.await.unwrap();
-        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 2);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 2);
         assert!(bot.processed.lock().unwrap().contains("message-1"));
         assert!(bot.processed.lock().unwrap().contains("message-2"));
         assert!(bot.processed.lock().unwrap().contains("message-3"));
@@ -3841,11 +3891,97 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 0);
-        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 0);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 1);
         assert!(bot.processed.lock().unwrap().contains("message-1"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_bot_max_events_reserves_concurrent_duplicate_events() {
+        let path = temp_file("max-events-concurrent-duplicates");
+        let config = Config {
+            max_events: 1,
+            ..mock_config(path.clone())
+        };
+        let bot = AccountBot::new(config).await.unwrap();
+        bot.processed.lock().unwrap().remember("message-1").unwrap();
+        let accepted_events = AtomicUsize::new(0);
+        let body = serde_json::to_vec(&SidecarEvent::message_created(json!({
+            "id": "message-1",
+            "roomId": "room-1",
+            "personId": "person-1",
+            "text": "hello"
+        })))
+        .unwrap();
+        let request_one = HttpRequest {
+            method: "POST".to_owned(),
+            path: DEFAULT_EVENT_PATH.to_owned(),
+            headers: BTreeMap::new(),
+            body: body.clone(),
+        };
+        let request_two = HttpRequest {
+            method: "POST".to_owned(),
+            path: DEFAULT_EVENT_PATH.to_owned(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let (first, second) = tokio::join!(
+            bot.handle_request(&request_one, None, &accepted_events),
+            bot.handle_request(&request_two, None, &accepted_events),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let mut statuses = [first.response.status, second.response.status];
+        statuses.sort();
+
+        assert_eq!(statuses, [200, 503]);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(accepted_events.load(Ordering::Relaxed), 0);
+        assert!(
+            first.response.body.contains("duplicate_message")
+                || second.response.body.contains("duplicate_message")
+        );
+        assert!(
+            first.response.body.contains("max events reached")
+                || second.response.body.contains("max events reached")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_bot_reply_worker_logs_success_when_receiver_dropped() {
+        let (sender, receiver) = oneshot::channel();
+        drop(receiver);
+
+        assert!(deliver_reply_result_or_log(
+            sender,
+            Ok(ReplyOutcome::Replied(Some("reply-1".to_owned()))),
+            "message-1".to_owned(),
+            "room-1".to_owned(),
+            "ack: hello".to_owned(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn account_bot_reply_worker_does_not_log_errors_when_receiver_dropped() {
+        let (sender, receiver) = oneshot::channel();
+        drop(receiver);
+
+        assert!(!deliver_reply_result_or_log(
+            sender,
+            Err(BotError::retry_after(
+                "reply timed out".to_owned(),
+                Duration::from_secs(1),
+            )),
+            "message-1".to_owned(),
+            "room-1".to_owned(),
+            "ack: hello".to_owned(),
+        ));
     }
 
     #[tokio::test]
