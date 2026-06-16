@@ -586,7 +586,9 @@ impl AccountBot {
         };
         match self.handle_event_with_permit(event, event_permit).await {
             Ok(action) => {
-                log_action_json(action.clone());
+                if !action.action_log_enqueued {
+                    let _ = log_action_json(action.clone());
+                }
                 let event_counted = action.counts_toward_max_events();
                 Ok(HandleResponse {
                     response: HttpResponse::json_value(
@@ -806,7 +808,7 @@ impl AccountBot {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
-        let outcome = self
+        let reply_result = self
             .send_reply(
                 inflight,
                 message_id.clone(),
@@ -817,9 +819,10 @@ impl AccountBot {
                 event_slot,
             )
             .await?;
-        Ok(BotAction::from_reply_outcome(
-            message_id, room_id, reply_text, outcome,
-        ))
+        Ok(
+            BotAction::from_reply_outcome(message_id, room_id, reply_text, reply_result.outcome)
+                .with_action_log_enqueued(reply_result.action_log_enqueued),
+        )
     }
 
     fn try_acquire_event_slot(&self) -> Option<EventSlot> {
@@ -886,7 +889,7 @@ impl AccountBot {
         reply_text: String,
         event_permit: Option<OwnedSemaphorePermit>,
         event_slot: EventSlot,
-    ) -> BotResult<ReplyOutcome> {
+    ) -> BotResult<ReplyActionResult> {
         let client = self
             .client
             .as_ref()
@@ -911,14 +914,20 @@ impl AccountBot {
                 event_permit,
                 event_slot,
             )
-            .await;
-            let _ = deliver_reply_result_or_log(
-                result_sender,
-                result,
-                log_message_id,
-                log_room_id,
-                log_reply_text,
-            );
+            .await
+            .map(|outcome| {
+                let action_log_enqueued = log_action_json(BotAction::from_reply_outcome(
+                    log_message_id,
+                    log_room_id,
+                    log_reply_text,
+                    outcome.clone(),
+                ));
+                ReplyActionResult {
+                    outcome,
+                    action_log_enqueued,
+                }
+            });
+            let _ = result_sender.send(result);
         });
         let result = result_receiver.await.map_err(|error| {
             self.state_persist_failed.store(true, Ordering::Relaxed);
@@ -1162,26 +1171,13 @@ async fn send_reply_worker(
 
 type BotResult<T> = std::result::Result<T, BotError>;
 
-fn deliver_reply_result_or_log(
-    result_sender: oneshot::Sender<BotResult<ReplyOutcome>>,
-    result: BotResult<ReplyOutcome>,
-    message_id: String,
-    room_id: String,
-    reply_text: String,
-) -> bool {
-    match result_sender.send(result) {
-        Ok(()) => false,
-        Err(Ok(outcome)) => {
-            log_action_json(BotAction::from_reply_outcome(
-                message_id, room_id, reply_text, outcome,
-            ));
-            true
-        }
-        Err(Err(_)) => false,
-    }
+#[derive(Debug)]
+struct ReplyActionResult {
+    outcome: ReplyOutcome,
+    action_log_enqueued: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ReplyOutcome {
     Replied(Option<String>),
     Ignored(&'static str),
@@ -1279,6 +1275,8 @@ impl BotMessage {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BotAction {
+    #[serde(skip)]
+    action_log_enqueued: bool,
     action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
@@ -1295,6 +1293,7 @@ struct BotAction {
 impl BotAction {
     fn ignored(reason: &'static str, message_id: Option<String>, room_id: Option<String>) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "ignored",
             reason: Some(reason),
             message_id,
@@ -1306,6 +1305,7 @@ impl BotAction {
 
     fn mock_replied(message_id: String, room_id: String, reply_text: String) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "mock_replied",
             reason: None,
             message_id: Some(message_id),
@@ -1322,6 +1322,7 @@ impl BotAction {
         reply_id: Option<String>,
     ) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "replied",
             reason: None,
             message_id: Some(message_id),
@@ -1343,6 +1344,11 @@ impl BotAction {
             }
             ReplyOutcome::Ignored(reason) => Self::ignored(reason, Some(message_id), Some(room_id)),
         }
+    }
+
+    fn with_action_log_enqueued(mut self, action_log_enqueued: bool) -> Self {
+        self.action_log_enqueued = action_log_enqueued;
+        self
     }
 
     fn counts_toward_max_events(&self) -> bool {
@@ -2338,14 +2344,14 @@ where
     Ok(())
 }
 
-fn log_action_json(action: BotAction) {
+fn log_action_json(action: BotAction) -> bool {
     if PENDING_ACTION_LOGS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
             (pending < MAX_PENDING_ACTION_LOGS).then_some(pending + 1)
         })
         .is_err()
     {
-        return;
+        return false;
     }
 
     let _ = tokio::task::spawn_blocking(move || {
@@ -2358,6 +2364,7 @@ fn log_action_json(action: BotAction) {
             );
         }
     });
+    true
 }
 
 #[cfg(test)]
@@ -3953,35 +3960,21 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[tokio::test]
-    async fn account_bot_reply_worker_logs_success_when_receiver_dropped() {
-        let (sender, receiver) = oneshot::channel();
-        drop(receiver);
-
-        assert!(deliver_reply_result_or_log(
-            sender,
-            Ok(ReplyOutcome::Replied(Some("reply-1".to_owned()))),
+    #[test]
+    fn reply_action_result_marks_worker_log_state() {
+        let action = BotAction::from_reply_outcome(
             "message-1".to_owned(),
             "room-1".to_owned(),
             "ack: hello".to_owned(),
-        ));
-    }
+            ReplyOutcome::Replied(Some("reply-1".to_owned())),
+        )
+        .with_action_log_enqueued(true);
 
-    #[tokio::test]
-    async fn account_bot_reply_worker_does_not_log_errors_when_receiver_dropped() {
-        let (sender, receiver) = oneshot::channel();
-        drop(receiver);
-
-        assert!(!deliver_reply_result_or_log(
-            sender,
-            Err(BotError::retry_after(
-                "reply timed out".to_owned(),
-                Duration::from_secs(1),
-            )),
-            "message-1".to_owned(),
-            "room-1".to_owned(),
-            "ack: hello".to_owned(),
-        ));
+        assert!(action.action_log_enqueued);
+        assert!(action.counts_toward_max_events());
+        let body = serde_json::to_string(&action).unwrap();
+        assert!(!body.contains("action_log_enqueued"));
+        assert!(!body.contains("actionLogEnqueued"));
     }
 
     #[tokio::test]

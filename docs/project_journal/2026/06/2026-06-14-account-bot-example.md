@@ -35,7 +35,7 @@ superseded_by:
 - `cargo fmt --check`
 - `node --check examples/sidecar-js/index.mjs`
 - `node --test examples/sidecar-js/index.test.mjs`
-- `cargo test --example account_bot --all-features` (63 account bot tests)
+- `cargo test --example account_bot --all-features` (62 account bot tests)
 - `cargo test --all-features` (includes example tests via explicit Cargo targets)
 - `git diff --check`
 - Project journal validation passed.
