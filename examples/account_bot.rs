@@ -586,7 +586,9 @@ impl AccountBot {
         };
         match self.handle_event_with_permit(event, event_permit).await {
             Ok(action) => {
-                log_action_json(action.clone());
+                if !action.action_log_enqueued {
+                    let _ = log_action_json(action.clone());
+                }
                 let event_counted = action.counts_toward_max_events();
                 Ok(HandleResponse {
                     response: HttpResponse::json_value(
@@ -668,11 +670,7 @@ impl AccountBot {
                     return Err(Error::Other("max events reached".to_owned()).into());
                 }
                 BeginInFlight::Processed => {
-                    return Ok(BotAction::ignored(
-                        "duplicate_message",
-                        Some(message_id),
-                        message.room_id.clone(),
-                    ));
+                    return self.duplicate_message_action(message_id, message.room_id.clone());
                 }
                 BeginInFlight::InProgress => {
                     match self.wait_for_in_flight_attempt(&message_id).await? {
@@ -688,11 +686,8 @@ impl AccountBot {
                             return Err(Error::Other("max events reached".to_owned()).into());
                         }
                         BeginInFlight::Processed => {
-                            return Ok(BotAction::ignored(
-                                "duplicate_message",
-                                Some(message_id),
-                                message.room_id.clone(),
-                            ));
+                            return self
+                                .duplicate_message_action(message_id, message.room_id.clone());
                         }
                         BeginInFlight::InProgress => {
                             return Err(BotError::retry_after(
@@ -813,7 +808,7 @@ impl AccountBot {
             .parent_id
             .clone()
             .unwrap_or_else(|| message_id.clone());
-        match self
+        let reply_result = self
             .send_reply(
                 inflight,
                 message_id.clone(),
@@ -823,15 +818,11 @@ impl AccountBot {
                 event_permit,
                 event_slot,
             )
-            .await?
-        {
-            ReplyOutcome::Replied(reply_id) => Ok(BotAction::replied(
-                message_id, room_id, reply_text, reply_id,
-            )),
-            ReplyOutcome::Ignored(reason) => {
-                Ok(BotAction::ignored(reason, Some(message_id), Some(room_id)))
-            }
-        }
+            .await?;
+        Ok(
+            BotAction::from_reply_outcome(message_id, room_id, reply_text, reply_result.outcome)
+                .with_action_log_enqueued(reply_result.action_log_enqueued),
+        )
     }
 
     fn try_acquire_event_slot(&self) -> Option<EventSlot> {
@@ -870,6 +861,25 @@ impl AccountBot {
         )
     }
 
+    fn duplicate_message_action(
+        &self,
+        message_id: String,
+        room_id: Option<String>,
+    ) -> BotResult<BotAction> {
+        if let Some(event_slot) = self.try_acquire_event_slot() {
+            event_slot.commit();
+            return Ok(BotAction::ignored(
+                "duplicate_message",
+                Some(message_id),
+                room_id,
+            ));
+        }
+        Err(BotError::retry_after(
+            "max events reached".to_owned(),
+            retry_after_for_lease(self.config.in_flight_wait),
+        ))
+    }
+
     async fn send_reply(
         &self,
         inflight: InFlightMessage,
@@ -879,7 +889,7 @@ impl AccountBot {
         reply_text: String,
         event_permit: Option<OwnedSemaphorePermit>,
         event_slot: EventSlot,
-    ) -> BotResult<ReplyOutcome> {
+    ) -> BotResult<ReplyActionResult> {
         let client = self
             .client
             .as_ref()
@@ -887,6 +897,9 @@ impl AccountBot {
             .clone();
         let state_persist_failed = self.state_persist_failed.clone();
         let attempt_lease = self.config.attempt_lease;
+        let log_message_id = message_id.clone();
+        let log_room_id = room_id.clone();
+        let log_reply_text = reply_text.clone();
         let (result_sender, result_receiver) = oneshot::channel();
         tokio::spawn(async move {
             let result = send_reply_worker(
@@ -901,7 +914,19 @@ impl AccountBot {
                 event_permit,
                 event_slot,
             )
-            .await;
+            .await
+            .map(|outcome| {
+                let action_log_enqueued = log_action_json(BotAction::from_reply_outcome(
+                    log_message_id,
+                    log_room_id,
+                    log_reply_text,
+                    outcome.clone(),
+                ));
+                ReplyActionResult {
+                    outcome,
+                    action_log_enqueued,
+                }
+            });
             let _ = result_sender.send(result);
         });
         let result = result_receiver.await.map_err(|error| {
@@ -1147,6 +1172,12 @@ async fn send_reply_worker(
 type BotResult<T> = std::result::Result<T, BotError>;
 
 #[derive(Debug)]
+struct ReplyActionResult {
+    outcome: ReplyOutcome,
+    action_log_enqueued: bool,
+}
+
+#[derive(Clone, Debug)]
 enum ReplyOutcome {
     Replied(Option<String>),
     Ignored(&'static str),
@@ -1244,6 +1275,8 @@ impl BotMessage {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BotAction {
+    #[serde(skip)]
+    action_log_enqueued: bool,
     action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
@@ -1260,6 +1293,7 @@ struct BotAction {
 impl BotAction {
     fn ignored(reason: &'static str, message_id: Option<String>, room_id: Option<String>) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "ignored",
             reason: Some(reason),
             message_id,
@@ -1271,6 +1305,7 @@ impl BotAction {
 
     fn mock_replied(message_id: String, room_id: String, reply_text: String) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "mock_replied",
             reason: None,
             message_id: Some(message_id),
@@ -1287,6 +1322,7 @@ impl BotAction {
         reply_id: Option<String>,
     ) -> Self {
         Self {
+            action_log_enqueued: false,
             action: "replied",
             reason: None,
             message_id: Some(message_id),
@@ -1294,6 +1330,25 @@ impl BotAction {
             reply_id,
             reply_text: Some(reply_text),
         }
+    }
+
+    fn from_reply_outcome(
+        message_id: String,
+        room_id: String,
+        reply_text: String,
+        outcome: ReplyOutcome,
+    ) -> Self {
+        match outcome {
+            ReplyOutcome::Replied(reply_id) => {
+                Self::replied(message_id, room_id, reply_text, reply_id)
+            }
+            ReplyOutcome::Ignored(reason) => Self::ignored(reason, Some(message_id), Some(room_id)),
+        }
+    }
+
+    fn with_action_log_enqueued(mut self, action_log_enqueued: bool) -> Self {
+        self.action_log_enqueued = action_log_enqueued;
+        self
     }
 
     fn counts_toward_max_events(&self) -> bool {
@@ -2289,14 +2344,14 @@ where
     Ok(())
 }
 
-fn log_action_json(action: BotAction) {
+fn log_action_json(action: BotAction) -> bool {
     if PENDING_ACTION_LOGS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
             (pending < MAX_PENDING_ACTION_LOGS).then_some(pending + 1)
         })
         .is_err()
     {
-        return;
+        return false;
     }
 
     let _ = tokio::task::spawn_blocking(move || {
@@ -2309,6 +2364,7 @@ fn log_action_json(action: BotAction) {
             );
         }
     });
+    true
 }
 
 #[cfg(test)]
@@ -3781,10 +3837,10 @@ mod tests {
         assert!(duplicate_response.contains("duplicate_message"));
         let second_duplicate_response = send_event_request(address, "message-3").await;
         assert!(
-            second_duplicate_response.starts_with("HTTP/1.1 200 OK"),
+            second_duplicate_response.starts_with("HTTP/1.1 503 Service Unavailable"),
             "{second_duplicate_response}"
         );
-        assert!(second_duplicate_response.contains("duplicate_message"));
+        assert!(second_duplicate_response.contains("max events reached"));
         let extra_response = send_event_request(address, "message-4").await;
         assert!(
             extra_response.starts_with("HTTP/1.1 503 Service Unavailable"),
@@ -3808,7 +3864,8 @@ mod tests {
             .unwrap()
             .unwrap();
         webex_server.await.unwrap();
-        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 2);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 2);
         assert!(bot.processed.lock().unwrap().contains("message-1"));
         assert!(bot.processed.lock().unwrap().contains("message-2"));
         assert!(bot.processed.lock().unwrap().contains("message-3"));
@@ -3841,11 +3898,83 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 0);
-        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 0);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 1);
         assert!(bot.processed.lock().unwrap().contains("message-1"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_bot_max_events_reserves_concurrent_duplicate_events() {
+        let path = temp_file("max-events-concurrent-duplicates");
+        let config = Config {
+            max_events: 1,
+            ..mock_config(path.clone())
+        };
+        let bot = AccountBot::new(config).await.unwrap();
+        bot.processed.lock().unwrap().remember("message-1").unwrap();
+        let accepted_events = AtomicUsize::new(0);
+        let body = serde_json::to_vec(&SidecarEvent::message_created(json!({
+            "id": "message-1",
+            "roomId": "room-1",
+            "personId": "person-1",
+            "text": "hello"
+        })))
+        .unwrap();
+        let request_one = HttpRequest {
+            method: "POST".to_owned(),
+            path: DEFAULT_EVENT_PATH.to_owned(),
+            headers: BTreeMap::new(),
+            body: body.clone(),
+        };
+        let request_two = HttpRequest {
+            method: "POST".to_owned(),
+            path: DEFAULT_EVENT_PATH.to_owned(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let (first, second) = tokio::join!(
+            bot.handle_request(&request_one, None, &accepted_events),
+            bot.handle_request(&request_two, None, &accepted_events),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let mut statuses = [first.response.status, second.response.status];
+        statuses.sort();
+
+        assert_eq!(statuses, [200, 503]);
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(accepted_events.load(Ordering::Relaxed), 0);
+        assert!(
+            first.response.body.contains("duplicate_message")
+                || second.response.body.contains("duplicate_message")
+        );
+        assert!(
+            first.response.body.contains("max events reached")
+                || second.response.body.contains("max events reached")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reply_action_result_marks_worker_log_state() {
+        let action = BotAction::from_reply_outcome(
+            "message-1".to_owned(),
+            "room-1".to_owned(),
+            "ack: hello".to_owned(),
+            ReplyOutcome::Replied(Some("reply-1".to_owned())),
+        )
+        .with_action_log_enqueued(true);
+
+        assert!(action.action_log_enqueued);
+        assert!(action.counts_toward_max_events());
+        let body = serde_json::to_string(&action).unwrap();
+        assert!(!body.contains("action_log_enqueued"));
+        assert!(!body.contains("actionLogEnqueued"));
     }
 
     #[tokio::test]
