@@ -45,6 +45,9 @@ const DEFAULT_ATTEMPT_LEASE_SECS: u64 = 30;
 const DEFAULT_IN_FLIGHT_WAIT_SECS: u64 = 8;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_PENDING_ACTION_LOGS: usize = 128;
+
+static PENDING_ACTION_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -583,18 +586,14 @@ impl AccountBot {
         };
         match self.handle_event_with_permit(event, event_permit).await {
             Ok(action) => {
-                if let Err(error) = print_json_line(&action) {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "account_bot_action_log_failed error={error}"
-                    );
-                }
+                log_action_json(action.clone());
+                let event_counted = action.counts_toward_max_events();
                 Ok(HandleResponse {
                     response: HttpResponse::json_value(
                         200,
                         json!({ "ok": true, "action": action }),
                     ),
-                    event_counted: true,
+                    event_counted,
                 })
             }
             Err(error) => Ok(HandleResponse {
@@ -1242,7 +1241,7 @@ impl BotMessage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BotAction {
     action: &'static str,
@@ -1294,6 +1293,24 @@ impl BotAction {
             room_id: Some(room_id),
             reply_id,
             reply_text: Some(reply_text),
+        }
+    }
+
+    fn counts_toward_max_events(&self) -> bool {
+        match self.action {
+            "mock_replied" | "replied" => true,
+            "ignored" => matches!(
+                self.reason,
+                Some(
+                    "duplicate_message"
+                        | "message_not_found"
+                        | "missing_room_id"
+                        | "room_not_allowed"
+                        | "self_message"
+                        | "reply_unknown"
+                )
+            ),
+            _ => false,
         }
     }
 }
@@ -2272,6 +2289,28 @@ where
     Ok(())
 }
 
+fn log_action_json(action: BotAction) {
+    if PENDING_ACTION_LOGS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            (pending < MAX_PENDING_ACTION_LOGS).then_some(pending + 1)
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    let _ = tokio::task::spawn_blocking(move || {
+        let result = print_json_line(&action);
+        PENDING_ACTION_LOGS.fetch_sub(1, Ordering::AcqRel);
+        if let Err(error) = result {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "account_bot_action_log_failed error={error}"
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2506,13 +2545,20 @@ mod tests {
     }
 
     async fn send_event_request(address: SocketAddr, message_id: &str) -> String {
-        let body = serde_json::to_string(&SidecarEvent::message_created(json!({
-            "id": message_id,
-            "roomId": "room-1",
-            "personId": "person-1",
-            "text": "hello"
-        })))
-        .unwrap();
+        send_sidecar_event_request(
+            address,
+            SidecarEvent::message_created(json!({
+                "id": message_id,
+                "roomId": "room-1",
+                "personId": "person-1",
+                "text": "hello"
+            })),
+        )
+        .await
+    }
+
+    async fn send_sidecar_event_request(address: SocketAddr, event: SidecarEvent) -> String {
+        let body = serde_json::to_string(&event).unwrap();
         let request = format!(
             "POST /webex/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -3797,6 +3843,57 @@ mod tests {
             .unwrap();
         assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 0);
         assert_eq!(bot.event_slots.load(Ordering::Relaxed), 0);
+        assert!(bot.processed.lock().unwrap().contains("message-1"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_bot_max_events_ignores_unsupported_events_before_counting() {
+        let path = temp_file("max-events-unsupported-before-created");
+        let config = Config {
+            max_events: 1,
+            ..mock_config(path.clone())
+        };
+        let bot = Arc::new(AccountBot::new(config).await.unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let loop_bot = bot.clone();
+        let loop_task = tokio::spawn(async move { run_http_loop(listener, loop_bot).await });
+
+        let unsupported_response = send_sidecar_event_request(
+            address,
+            SidecarEvent::new(
+                "messages",
+                "deleted",
+                json!({
+                    "id": "message-deleted",
+                    "roomId": "room-1"
+                }),
+            ),
+        )
+        .await;
+        assert!(unsupported_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(unsupported_response.contains("unsupported_event"));
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 0);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 0);
+        assert!(!loop_task.is_finished());
+
+        let health_response = send_health_request(address).await;
+        assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+
+        let created_response = send_event_request(address, "message-1").await;
+        assert!(created_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(created_response.contains("mock_replied"));
+
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(bot.completed_event_slots.load(Ordering::Relaxed), 1);
+        assert_eq!(bot.event_slots.load(Ordering::Relaxed), 1);
         assert!(bot.processed.lock().unwrap().contains("message-1"));
 
         let _ = fs::remove_file(path);
