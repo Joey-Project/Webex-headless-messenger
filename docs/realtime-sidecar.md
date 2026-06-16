@@ -17,6 +17,9 @@ The sidecar pieces are:
   events.
 - `webex-headless sidecar receive`: loopback HTTP receiver that emits accepted
   `SidecarEvent` envelopes as JSON Lines and exposes a local health endpoint.
+- `examples/account_bot.rs`: small long-running generic-account bot demo that
+  accepts the same sidecar HTTP events, filters self messages, stores processed
+  message IDs, and replies through the REST client.
 - `examples/sidecar_receiver.rs`: smaller receiver example kept for embedding
   and mock protocol tests.
 
@@ -66,6 +69,52 @@ node examples/sidecar-js/index.mjs
 
 Expected receiver output includes one compact `SidecarEvent` JSON line and a
 stderr line like `sidecar_event_accepted_from=127.0.0.1:...`.
+
+## Account Bot Mock E2E
+
+Use `examples/account_bot.rs` when you want a concrete Rust process instead of
+the JSONL receiver. In mock mode it does not call Webex; it validates the local
+sidecar HTTP protocol, bearer token, room filtering, self-message filtering when
+`WEBEX_ACCOUNT_BOT_SELF_PERSON_ID` matches the mock `personId`, and
+processed-message ID state file. It also keeps the local HTTP listener responsive by handling
+connections concurrently with a bounded request count and per-request handler
+timeout. In live mode, the bot verifies state persistence at startup, records a
+bounded attempt lease before sending the REST reply, and marks the message ID
+processed only after Webex accepts the reply. This keeps ordinary Webex/API
+failures retryable while avoiding immediate duplicate replies after a timeout or
+restart. If the connection to Webex is lost or the response cannot be decoded
+after the `create_message` request was sent, the bot records an at-most-once
+`reply_unknown` result instead of risking duplicate replies; explicit Webex API
+401/408/429/5xx responses remain retryable, with upstream 401 token races mapped
+back to receiver HTTP 503 so the sidecar can retry after token refresh. If Webex
+accepts a reply but the state write fails, the bot returns a
+retryable 503 with `Retry-After`, keeps same-process de-duplication in memory,
+and reports degraded health.
+
+Terminal 1:
+
+```bash
+WEBEX_ACCOUNT_BOT_MOCK=1 \
+WEBEX_ACCOUNT_BOT_BIND=127.0.0.1:8787 \
+WEBEX_ACCOUNT_BOT_STATE_FILE=.codex-tmp/account-bot/processed-message-ids.txt \
+WEBEX_ACCOUNT_BOT_MAX_EVENTS=1 \
+WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
+cargo run --example account_bot --all-features
+```
+
+Terminal 2:
+
+```bash
+WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
+WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
+WEBEX_SIDECAR_MESSAGE_EVENTS=created \
+WEBEX_SIDECAR_MOCK_EVENT=1 \
+node examples/sidecar-js/index.mjs
+```
+
+For live mode, set `WEBEX_ACCESS_TOKEN_FILE` to the raw access-token file
+published by the token refresh timer. The bot reloads that file for each REST
+request, so token rotation does not require restarting the bot.
 
 ## Live Webex Listener
 
@@ -132,7 +181,9 @@ cargo run --bin webex-headless -- \
 ```
 
 For bot tokens, Webex bot visibility rules apply; the bot may only receive
-message events it is allowed to see.
+message events it is allowed to see. When the target receiver is the account bot,
+set `WEBEX_SIDECAR_MESSAGE_EVENTS=created`; the bot intentionally ignores other
+message event types and they should not consume a bounded demo run.
 
 ## Long-Running Service Mode
 
@@ -177,8 +228,17 @@ WEBEX_SIDECAR_TOKEN_RELOAD_INTERVAL_MS=60000
 WEBEX_SIDECAR_FORWARD_RETRIES=3
 WEBEX_SIDECAR_FORWARD_TIMEOUT_MS=10000
 WEBEX_SIDECAR_MAX_IN_FLIGHT=8
+WEBEX_SIDECAR_MAX_QUEUED_FORWARDS=32
 WEBEX_SIDECAR_HEALTH_BIND=127.0.0.1:8788
 ```
+
+For retryable receiver failures, the sidecar honors `Retry-After` response
+headers as the minimum retry delay. Retry sleeps are clamped to Node's safe timer
+range and do not occupy `WEBEX_SIDECAR_MAX_IN_FLIGHT` active forward slots, but
+they still retain their payload and count against the same bounded outstanding
+forward budget as active-slot waiters. If `WEBEX_SIDECAR_MAX_QUEUED_FORWARDS`
+fills, the sidecar treats it as overload and exits rather than retaining
+unbounded message payloads in memory.
 
 Validate sidecar config without loading the Webex SDK. This check also requires `WEBEX_SIDECAR_TOKEN` unless `WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED=1` is explicitly set for local unsafe testing:
 

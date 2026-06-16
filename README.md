@@ -27,6 +27,8 @@ Implemented in the first slice:
 - Local file upload helper for `multipart/form-data` message creation.
 - JavaScript SDK realtime sidecar demo that forwards normalized message events
   to a local Rust loopback receiver.
+- Account bot example that receives sidecar events, filters self messages,
+  persists processed message IDs, and replies through the REST client.
 - `webex-headless` CLI for device authorization, room/message REST calls,
   polling, and a loopback sidecar receiver.
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
@@ -311,6 +313,77 @@ required realtime scopes (`spark:all` plus `spark:kms`), forwarding-token
 configuration, token refresh/reload, health checks, loopback restrictions, and
 security notes. See [deploy/systemd](deploy/systemd) for Linux supervisor
 templates.
+
+## Account Bot Example
+
+`examples/account_bot.rs` is a small long-running bot process that can replace
+the JSONL receiver in the sidecar stack. It accepts the same sidecar HTTP event
+envelope, requires the same local forwarding bearer token, filters self
+messages, optionally restricts rooms with `WEBEX_ACCOUNT_BOT_ROOM_IDS`, stores
+processed message IDs in a file, and replies to new messages with the REST
+client. The listener bounds accepted sockets with
+`WEBEX_ACCOUNT_BOT_MAX_CONCURRENT_CONNECTIONS`, bounds event processing with
+`WEBEX_ACCOUNT_BOT_MAX_CONCURRENT_REQUESTS`, and limits slow request/REST work
+with `WEBEX_ACCOUNT_BOT_REQUEST_READ_TIMEOUT_SECS`,
+`WEBEX_ACCOUNT_BOT_HANDLER_TIMEOUT_SECS`, and
+`WEBEX_ACCOUNT_BOT_WEBEX_REQUEST_TIMEOUT_SECS`. In live mode, the state file is
+verified at startup, a bounded attempt lease is persisted before the REST reply,
+and the message ID is marked processed only after Webex accepts the reply. If the
+connection to Webex is lost or the response cannot be decoded after the
+`create_message` request was sent, the bot records an at-most-once
+`reply_unknown` result instead of risking duplicate replies; explicit Webex API
+401/408/429/5xx responses remain retryable, with upstream 401 token races mapped
+back to receiver HTTP 503 so the sidecar can retry after token refresh.
+`WEBEX_ACCOUNT_BOT_HANDLER_TIMEOUT_SECS` and
+`WEBEX_ACCOUNT_BOT_IN_FLIGHT_WAIT_SECS` should stay below
+`WEBEX_SIDECAR_FORWARD_TIMEOUT_MS` so a sidecar retry can observe the bot's
+final success, explicit failure, or refreshed lease instead of exhausting its
+retry window while the original request is still running.
+When Webex returns a retryable API response with `Retry-After`, the bot forwards
+that header and the JS sidecar treats it as the minimum retry delay without
+holding an active forward slot during the sleep. Those retry-delayed forwards
+still count against the same bounded outstanding-forward budget as active-slot
+waiters, so `WEBEX_SIDECAR_MAX_QUEUED_FORWARDS` makes overload fail closed
+instead of growing memory without limit. If Webex
+accepts a reply but the local processed-message state cannot be persisted, the
+bot returns retryable HTTP 503 with `Retry-After`, keeps in-memory de-duplication
+for same-process retries, and marks health as degraded.
+`WEBEX_ACCOUNT_BOT_ATTEMPT_LEASE_SECS` controls how long a restart or timeout
+keeps a reply attempt from being retried immediately; the default 30-second
+lease covers the JS sidecar's default retry window, and shorter leases should
+be paired with shorter sidecar retries only when duplicate replies are acceptable.
+
+Local mock E2E without Webex credentials:
+
+Terminal 1:
+
+```bash
+WEBEX_ACCOUNT_BOT_MOCK=1 \
+WEBEX_ACCOUNT_BOT_BIND=127.0.0.1:8787 \
+WEBEX_ACCOUNT_BOT_STATE_FILE=.codex-tmp/account-bot/processed-message-ids.txt \
+WEBEX_ACCOUNT_BOT_MAX_EVENTS=1 \
+WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
+cargo run --example account_bot --all-features
+```
+
+Terminal 2:
+
+```bash
+WEBEX_SIDECAR_TARGET_URL=http://127.0.0.1:8787/webex/events \
+WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
+WEBEX_SIDECAR_MESSAGE_EVENTS=created \
+WEBEX_SIDECAR_MOCK_EVENT=1 \
+node examples/sidecar-js/index.mjs
+```
+
+For a live account bot, publish a raw access token with `auth refresh
+--access-token-file`, point `WEBEX_ACCESS_TOKEN_FILE` at that file, and keep the
+token refresh timer running. Set the JS sidecar's `WEBEX_SIDECAR_MESSAGE_EVENTS`
+to `created` when forwarding to this bot; the bot intentionally handles only new
+message events. The bot reloads the access token file for each REST request, so
+token rotation by the timer is picked up without restarting the bot. Use
+`WEBEX_ACCOUNT_BOT_SELF_PERSON_ID` to avoid the startup `people/me` call when you
+already know the generic account person ID.
 
 ## Smoke Test
 

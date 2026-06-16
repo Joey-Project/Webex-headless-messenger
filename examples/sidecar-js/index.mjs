@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { isIP } from 'node:net';
+import { pathToFileURL } from 'node:url';
 
 const targetUrl = process.env.WEBEX_SIDECAR_TARGET_URL ?? 'http://127.0.0.1:8787/webex/events';
 const target = validateLoopbackUrl(
@@ -14,9 +15,14 @@ const forwardToken = process.env.WEBEX_SIDECAR_TOKEN;
 const allowUnauthenticatedForward = process.env.WEBEX_SIDECAR_ALLOW_UNAUTHENTICATED === '1';
 const forwardTimeoutMs = parsePositiveInteger(process.env.WEBEX_SIDECAR_FORWARD_TIMEOUT_MS, 10000);
 const maxInFlightForwards = parsePositiveInteger(process.env.WEBEX_SIDECAR_MAX_IN_FLIGHT, 8);
+const maxQueuedForwards = parseNonNegativeInteger(
+  process.env.WEBEX_SIDECAR_MAX_QUEUED_FORWARDS,
+  Math.max(32, maxInFlightForwards * 4)
+);
 const forwardRetries = parseNonNegativeInteger(process.env.WEBEX_SIDECAR_FORWARD_RETRIES, 3);
 const retryBaseMs = parsePositiveInteger(process.env.WEBEX_SIDECAR_RETRY_BASE_MS, 500);
 const retryMaxMs = parsePositiveInteger(process.env.WEBEX_SIDECAR_RETRY_MAX_MS, 5000);
+const maxTimerDelayMs = 2_147_483_647;
 const tokenReloadIntervalMs = parseNonNegativeInteger(
   process.env.WEBEX_SIDECAR_TOKEN_RELOAD_INTERVAL_MS,
   60000
@@ -29,7 +35,9 @@ const livePath = process.env.WEBEX_SIDECAR_LIVE_PATH ?? '/livez';
 const messageEvents = parseMessageEvents(process.env.WEBEX_SIDECAR_MESSAGE_EVENTS ?? 'created,deleted');
 
 let webexModules;
+let reservedForwards = 0;
 let inFlightForwards = 0;
+let forwardWaiters = [];
 let shuttingDown = false;
 let activeListener = null;
 let healthServer = null;
@@ -46,6 +54,8 @@ const status = {
   tokenExpiresAt: null,
   forwardCount: 0,
   inFlightForwards: 0,
+  maxQueuedForwards,
+  queuedForwards: 0,
   lastForwardAt: null,
   lastForwardError: null,
   lastReloadAt: null,
@@ -53,10 +63,18 @@ const status = {
 };
 
 class ForwardHttpError extends Error {
-  constructor(statusCode, body) {
+  constructor(statusCode, body, retryAfterMs = null) {
     super(`forward failed status=${statusCode} body=${body}`);
     this.name = 'ForwardHttpError';
     this.statusCode = statusCode;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+class ForwardQueueFullError extends Error {
+  constructor(limit) {
+    super(`too many queued forwards limit=${limit}`);
+    this.name = 'ForwardQueueFullError';
   }
 }
 
@@ -205,15 +223,13 @@ function loadedAccessToken(accessToken, source, expiresAt) {
 }
 
 async function forward(resource, event, data) {
-  if (inFlightForwards >= maxInFlightForwards) {
-    throw new Error(`too many in-flight forwards limit=${maxInFlightForwards}`);
-  }
-  inFlightForwards += 1;
-  status.inFlightForwards = inFlightForwards;
+  let budgetAcquired = false;
   try {
+    acquireForwardBudget();
+    budgetAcquired = true;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await forwardOnce(resource, event, data);
+        await forwardWithSlot(resource, event, data);
         status.forwardCount += 1;
         status.lastForwardAt = new Date().toISOString();
         status.lastForwardError = null;
@@ -223,17 +239,70 @@ async function forward(resource, event, data) {
           status.lastForwardError = error.message;
           throw error;
         }
-        const delay = retryDelayMs(attempt);
+        const delay = retryDelayMs(attempt, error);
         console.warn(
           `sidecar_forward_retry resource=${resource} event=${event} attempt=${attempt + 1} delay_ms=${delay} error=${error.message}`
         );
         await sleepMs(delay);
       }
     }
+  } catch (error) {
+    if (error instanceof ForwardQueueFullError) {
+      status.lastForwardError = error.message;
+    }
+    throw error;
   } finally {
-    inFlightForwards -= 1;
-    status.inFlightForwards = inFlightForwards;
+    if (budgetAcquired) {
+      releaseForwardBudget();
+    }
   }
+}
+
+async function forwardWithSlot(resource, event, data) {
+  await acquireForwardSlot();
+  try {
+    await forwardOnce(resource, event, data);
+  } finally {
+    releaseForwardSlot();
+  }
+}
+
+async function acquireForwardSlot() {
+  while (inFlightForwards >= maxInFlightForwards) {
+    await new Promise((resolve) => {
+      forwardWaiters.push(resolve);
+      refreshForwardStatus();
+    });
+  }
+  inFlightForwards += 1;
+  refreshForwardStatus();
+}
+
+function releaseForwardSlot() {
+  inFlightForwards -= 1;
+  const next = forwardWaiters.shift();
+  refreshForwardStatus();
+  if (next) {
+    queueMicrotask(next);
+  }
+}
+
+function acquireForwardBudget() {
+  if (reservedForwards >= maxInFlightForwards + maxQueuedForwards) {
+    throw new ForwardQueueFullError(maxQueuedForwards);
+  }
+  reservedForwards += 1;
+  refreshForwardStatus();
+}
+
+function releaseForwardBudget() {
+  reservedForwards -= 1;
+  refreshForwardStatus();
+}
+
+function refreshForwardStatus() {
+  status.inFlightForwards = inFlightForwards;
+  status.queuedForwards = Math.max(0, reservedForwards - inFlightForwards);
 }
 
 async function forwardOnce(resource, event, data) {
@@ -260,7 +329,7 @@ async function forwardOnce(resource, event, data) {
   });
   const body = await response.text();
   if (!response.ok) {
-    throw new ForwardHttpError(response.status, body);
+    throw new ForwardHttpError(response.status, body, parseRetryAfterMs(response.headers.get('retry-after')));
   }
   console.log(`sidecar_forwarded resource=${resource} event=${event} status=${response.status}`);
 }
@@ -269,19 +338,49 @@ function shouldRetryForward(error, attempt) {
   if (attempt >= forwardRetries) {
     return false;
   }
+  if (error instanceof ForwardQueueFullError) {
+    return false;
+  }
   if (error instanceof ForwardHttpError) {
     return error.statusCode === 408 || error.statusCode === 429 || error.statusCode >= 500;
   }
   return true;
 }
 
-function retryDelayMs(attempt) {
+function retryDelayMs(attempt, error) {
   const base = Math.min(retryMaxMs, retryBaseMs * 2 ** attempt);
-  return base + Math.floor(Math.random() * Math.max(1, Math.floor(base * 0.2)));
+  const jittered = base + Math.floor(Math.random() * Math.max(1, Math.floor(base * 0.2)));
+  if (error instanceof ForwardHttpError && Number.isFinite(error.retryAfterMs)) {
+    return clampDelayMs(Math.max(jittered, error.retryAfterMs));
+  }
+  return clampDelayMs(jittered);
+}
+
+function parseRetryAfterMs(value) {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return clampDelayMs(Math.max(1, Math.ceil(seconds * 1000)));
+  }
+  const deadlineMs = Date.parse(trimmed);
+  if (!Number.isFinite(deadlineMs)) {
+    return null;
+  }
+  return clampDelayMs(Math.max(1, Math.ceil(deadlineMs - Date.now())));
 }
 
 function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, clampDelayMs(ms)));
+}
+
+function clampDelayMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return 1;
+  }
+  return Math.min(Math.ceil(ms), maxTimerDelayMs);
 }
 
 function loadWebexModules() {
@@ -459,6 +558,8 @@ function healthPayload(ok) {
     tokenExpiresAt: status.tokenExpiresAt,
     forwardCount: status.forwardCount,
     inFlightForwards: status.inFlightForwards,
+    queuedForwards: status.queuedForwards,
+    maxQueuedForwards: status.maxQueuedForwards,
     lastForwardAt: status.lastForwardAt,
     lastForwardError: healthErrorStatus(status.lastForwardError),
     lastReloadAt: status.lastReloadAt,
@@ -509,6 +610,7 @@ async function main() {
     await forward('messages', 'created', {
       id: 'mock-message',
       roomId: 'mock-room',
+      personId: process.env.WEBEX_SIDECAR_MOCK_PERSON_ID || 'mock-person',
       personEmail: 'generic-account@example.com',
       text: 'mock sidecar event',
       created: new Date().toISOString(),
@@ -547,6 +649,14 @@ async function main() {
   process.stdin.resume();
 }
 
+export const __test = {
+  forward,
+  status,
+  ForwardHttpError,
+  ForwardQueueFullError,
+};
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 process.on('SIGINT', () => {
   shutdown().catch((error) => {
     console.error(error);
@@ -564,3 +674,4 @@ await main().catch(async (error) => {
   console.error(error);
   await shutdown(1);
 });
+}

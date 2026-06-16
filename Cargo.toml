@@ -11,13 +11,14 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hex = { version = "0.4", optional = true }
 hmac = { version = "0.12", optional = true }
+httpdate = "1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = { version = "0.10", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }
 url = { version = "2", features = ["serde"] }
 percent-encoding = "2"
 
@@ -28,5 +29,20 @@ native-tls = ["reqwest/native-tls"]
 webhooks = ["dep:hex", "dep:hmac", "dep:sha1"]
 experimental-websocket = []
 
+[[example]]
+name = "account_bot"
+path = "examples/account_bot.rs"
+test = true
+
+[[example]]
+name = "sidecar_receiver"
+path = "examples/sidecar_receiver.rs"
+test = true
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+test = true
+
 [dev-dependencies]
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread"] }

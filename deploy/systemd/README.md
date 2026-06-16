@@ -16,8 +16,11 @@ The example manages three pieces:
 
 The bundled receiver writes accepted events to journald as JSON Lines. For a real
 automation, replace that unit with your bot service or make your bot consume the
-receiver output. Keep the same forwarding token, loopback binding, health checks,
-and token-refresh timer. OAuth credentials and the refresh-token cache stay
+receiver output. `examples/account_bot.rs` is a concrete starting point for the
+replacement service: it accepts the same sidecar HTTP events, persists processed
+message IDs, filters self messages, and replies through the REST client. Keep the
+same forwarding token, loopback binding, health checks, and token-refresh timer.
+OAuth credentials and the refresh-token cache stay
 under the token-refresh identity. The token-refresh service explicitly opts into
 a group-readable raw access-token file for the JS sidecar inside a dedicated
 setgid directory; the receiver runs under an identity with no OAuth token file
@@ -176,9 +179,22 @@ journalctl -u webex-headless-token-refresh.service
 - The JS sidecar exits when forwarding retries are exhausted. Systemd restarts
   it; the bot must still use REST catch-up and message ID de-duplication to fill
   restart gaps.
-- If you replace the receiver with a bot service, update the target dependencies,
-  the JS service `Requires=` and `After=` lines, and
-  `WEBEX_SIDECAR_TARGET_URL` together.
+- If you replace the receiver with `examples/account_bot.rs` or another bot
+  service, update the target dependencies, the JS service `Requires=` and
+  `After=` lines, and `WEBEX_SIDECAR_TARGET_URL` together. Point the bot at the
+  same raw `WEBEX_ACCESS_TOKEN_FILE` published by the refresh timer if it needs
+  to reply through REST, and keep `WEBEX_SIDECAR_MESSAGE_EVENTS=created` unless
+  the replacement bot explicitly handles other message event types. The stock receiver unit intentionally cannot read
+  `/var/lib/webex-headless-access`; a REST-replying bot unit must instead grant
+  read-only access to that path, for example with
+  `SupplementaryGroups=webex-headless-sidecar` plus
+  `ReadOnlyPaths=/var/lib/webex-headless-access`, and must not keep the
+  receiver unit's `InaccessiblePaths=/var/lib/webex-headless-access`. Give the
+  replacement bot a persistent writable state directory as well, for example
+  `StateDirectory=webex-headless-account-bot`,
+  `StateDirectoryMode=0700`,
+  `ReadWritePaths=/var/lib/webex-headless-account-bot`, and
+  `WEBEX_ACCOUNT_BOT_STATE_FILE=/var/lib/webex-headless-account-bot/processed-message-ids.txt`.
 - The JS startup refresh is best-effort through `Wants=` / `After=` on the
   token-refresh service. `TimeoutStartSec=45s` bounds startup delay when Webex or
   the network hangs. If systemd kills a refresh after Webex has rotated the
