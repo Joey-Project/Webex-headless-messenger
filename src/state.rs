@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+use std::os::unix::fs::DirBuilderExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -399,9 +401,9 @@ impl JsonlStateStore {
 #[cfg(feature = "sqlite-state-cache")]
 impl SqliteStateCache {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        prepare_sqlite_cache_file(path)?;
-        let conn = open_sqlite_cache_connection(path)?;
+        let path = stable_sqlite_cache_path(path.as_ref())?;
+        prepare_sqlite_cache_file(&path)?;
+        let conn = open_sqlite_cache_connection(&path)?;
         let cache = Self { conn };
         cache.initialize()?;
         Ok(cache)
@@ -911,6 +913,16 @@ fn remaining_lease(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<Dura
 }
 
 #[cfg(feature = "sqlite-state-cache")]
+fn stable_sqlite_cache_path(path: &Path) -> Result<PathBuf> {
+    reject_sqlite_uri_path(path)?;
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(feature = "sqlite-state-cache")]
 fn open_sqlite_cache_connection(path: &Path) -> Result<Connection> {
     reject_sqlite_uri_path(path)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -939,14 +951,119 @@ fn reject_sqlite_uri_path(path: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "sqlite-state-cache")]
-fn prepare_sqlite_cache_file(path: &Path) -> Result<()> {
-    reject_sqlite_uri_path(path)?;
-    if let Some(parent) = path
+fn prepare_sqlite_cache_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = sqlite_cache_parent_path(path) {
+        validate_existing_sqlite_cache_parent_dirs(parent)?;
+        create_sqlite_cache_parent_dir(parent)?;
+        validate_sqlite_cache_parent_dirs(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn sqlite_cache_parent_path(path: &Path) -> Option<&Path> {
+    match path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        Some(parent) => Some(parent),
+        None if path.is_relative() => Some(Path::new(".")),
+        None => None,
     }
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn create_sqlite_cache_parent_dir(parent: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(parent)?;
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "sqlite-state-cache"))]
+fn create_sqlite_cache_parent_dir(parent: &Path) -> Result<()> {
+    fs::create_dir_all(parent)?;
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn validate_existing_sqlite_cache_parent_dirs(parent: &Path) -> Result<()> {
+    for dir in sqlite_cache_parent_chain(parent)? {
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) => validate_sqlite_cache_parent_dir(&dir, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "sqlite-state-cache"))]
+fn validate_existing_sqlite_cache_parent_dirs(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn validate_sqlite_cache_parent_dirs(parent: &Path) -> Result<()> {
+    for dir in sqlite_cache_parent_chain(parent)? {
+        let metadata = fs::symlink_metadata(&dir)?;
+        validate_sqlite_cache_parent_dir(&dir, &metadata)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "sqlite-state-cache"))]
+fn validate_sqlite_cache_parent_dirs(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn sqlite_cache_parent_chain(parent: &Path) -> Result<Vec<PathBuf>> {
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(parent)
+    };
+    let mut chain = Vec::new();
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        chain.push(current.clone());
+    }
+    Ok(chain)
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn validate_sqlite_cache_parent_dir(parent: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::Other(format!(
+            "sqlite state cache parent {} is a symbolic link",
+            parent.display()
+        )));
+    }
+    if !file_type.is_dir() {
+        return Err(Error::Other(format!(
+            "sqlite state cache parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    ensure_sqlite_cache_trusted_owner(parent, metadata)?;
+    let mode = metadata.mode();
+    let group_or_world_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if group_or_world_writable && !sticky {
+        return Err(Error::Other(format!(
+            "sqlite state cache parent {} is group/world-writable without sticky bit",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn prepare_sqlite_cache_file(path: &Path) -> Result<()> {
+    reject_sqlite_uri_path(path)?;
+    prepare_sqlite_cache_parent(path)?;
 
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1002,7 +1119,31 @@ fn ensure_sqlite_cache_regular_file(path: &Path, metadata: &fs::Metadata) -> Res
             path.display()
         )));
     }
+    ensure_sqlite_cache_trusted_owner(path, metadata)?;
     Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn ensure_sqlite_cache_trusted_owner(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let owner = metadata.uid();
+    let current = current_effective_uid()?;
+    if owner != 0 && owner != current {
+        return Err(Error::Other(format!(
+            "sqlite state cache path {} is not owned by root or the current user",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "sqlite-state-cache"))]
+fn ensure_sqlite_cache_trusted_owner(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn current_effective_uid() -> Result<u32> {
+    Ok(rustix::process::geteuid().as_raw())
 }
 
 #[cfg(all(unix, feature = "sqlite-state-cache"))]
@@ -1069,6 +1210,8 @@ mod tests {
     use super::*;
 
     static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "sqlite-state-cache")]
+    static CWD_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
     fn ts(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).single().unwrap()
@@ -1602,6 +1745,119 @@ mod tests {
         );
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_creates_private_parent_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = temp_file("sqlite-cache-private-parent");
+        let db_path = parent.join("cache.db");
+
+        let _cache = SqliteStateCache::open(&db_path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir(parent);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_rejects_unsafe_parent_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = temp_file("sqlite-cache-unsafe-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let db_path = parent.join("cache.db");
+
+        assert!(SqliteStateCache::open(&db_path).is_err());
+        assert!(!db_path.exists());
+        assert_eq!(
+            fs::symlink_metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir(parent);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_rejects_unsafe_ancestor_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let ancestor = temp_file("sqlite-cache-unsafe-ancestor");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        let parent = ancestor.join("safe-parent");
+        let db_path = parent.join("cache.db");
+
+        assert!(SqliteStateCache::open(&db_path).is_err());
+        assert!(!parent.exists());
+        assert!(!db_path.exists());
+        assert_eq!(
+            fs::symlink_metadata(&ancestor)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777
+        );
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir(ancestor);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_stabilizes_relative_path() {
+        let _guard = CWD_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let old_cwd = env::current_dir().unwrap();
+        let cwd = temp_file("sqlite-cache-stable-cwd");
+        fs::create_dir(&cwd).unwrap();
+        env::set_current_dir(&cwd).unwrap();
+
+        let path = stable_sqlite_cache_path(Path::new("cache.db")).unwrap();
+
+        env::set_current_dir(&old_cwd).unwrap();
+        assert_eq!(path, cwd.join("cache.db"));
+
+        let _ = fs::remove_dir(cwd);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_rejects_bare_relative_path_in_unsafe_cwd() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = CWD_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let old_cwd = env::current_dir().unwrap();
+        let cwd = temp_file("sqlite-cache-unsafe-cwd");
+        fs::create_dir(&cwd).unwrap();
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o777)).unwrap();
+        env::set_current_dir(&cwd).unwrap();
+
+        let result = SqliteStateCache::open(Path::new("cache.db"));
+        let cache_exists = Path::new("cache.db").exists();
+
+        env::set_current_dir(&old_cwd).unwrap();
+        assert!(result.is_err());
+        assert!(!cache_exists);
+
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir(cwd);
     }
 
     #[cfg(all(unix, feature = "sqlite-state-cache"))]
