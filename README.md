@@ -322,11 +322,7 @@ async fn main() -> webex_headless_messenger::Result<()> {
 
     while let Some(batch) = batches.recv().await {
         let batch = batch?;
-        for checkpoint in batch.checkpoints {
-            // Persist this checkpoint in durable state after handling the batch.
-            eprintln!("checkpoint {} {:?}", checkpoint.room_id, checkpoint.seen_message_ids);
-        }
-        for event in batch.events {
+        for event in &batch.events {
             match event {
                 Ok(room_message) => {
                     println!("{} {:?}", room_message.room_id, room_message.message.text);
@@ -335,6 +331,10 @@ async fn main() -> webex_headless_messenger::Result<()> {
                     eprintln!("recoverable multi-room poll error: {error}");
                 }
             }
+        }
+        for checkpoint in &batch.checkpoints {
+            // Persist this checkpoint only after handling the batch events above.
+            eprintln!("checkpoint {} {:?}", checkpoint.room_id, checkpoint.seen_message_ids);
         }
     }
 

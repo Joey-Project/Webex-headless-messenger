@@ -696,16 +696,12 @@ impl MultiRoomMessagePoller {
             }
         }
         for (room_id, entry) in std::mem::take(&mut self.rooms) {
-            if entry.poller.has_pending_backlog() {
-                next_rooms.insert(room_id, entry);
-            } else {
-                remember_inactive_room(
-                    &mut next_inactive_rooms,
-                    &mut next_inactive_room_order,
-                    room_id,
-                    entry,
-                );
-            }
+            remember_inactive_room(
+                &mut next_inactive_rooms,
+                &mut next_inactive_room_order,
+                room_id,
+                entry,
+            );
         }
         prune_inactive_rooms(
             &mut next_inactive_rooms,
@@ -1633,6 +1629,7 @@ mod tests {
                     r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
                 MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+                MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
                 MockResponse::json(
                     r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
@@ -1658,6 +1655,7 @@ mod tests {
 
         let first_events = poller.poll_once().await.unwrap().events;
         let second_events = poller.poll_once().await.unwrap().events;
+        let restored_events = poller.poll_once().await.unwrap().events;
 
         assert!(first_events.is_empty());
         assert_eq!(
@@ -1666,13 +1664,22 @@ mod tests {
                 .filter_map(|event| event.as_ref().ok())
                 .map(|message| message.message.id.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["a-older", "a-newer", "b-later"]
+            ["b-later"]
+        );
+        assert_eq!(
+            restored_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer"]
         );
 
         let requests = requests.await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert!(requests[3].starts_with("GET /v1/rooms?"));
-        assert!(requests[4].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[4].starts_with("GET /v1/rooms?"));
+        assert!(requests[5].starts_with("GET /v1/messages?page=2"));
     }
 
     #[tokio::test]
