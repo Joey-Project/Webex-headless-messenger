@@ -32,6 +32,8 @@ pub use realtime::{
 };
 pub use rooms::room_id_candidates_from_link;
 pub use sidecar::SidecarEvent;
+#[cfg(feature = "sqlite-state-cache")]
+pub use state::SqliteStateCache;
 pub use state::{
     AttemptLease, AttemptLeaseStatus, AttemptStart, JsonlStateStore, StateEvent, StateRecord,
     StateSnapshot,

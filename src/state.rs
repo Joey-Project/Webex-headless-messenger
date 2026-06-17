@@ -15,6 +15,8 @@ use std::{
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "sqlite-state-cache")]
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -82,6 +84,17 @@ impl Drop for StatePathLock {
 pub struct JsonlStateStore {
     path: PathBuf,
     snapshot: StateSnapshot,
+}
+
+/// Rebuildable SQLite index over the JSONL state source of truth.
+///
+/// This cache is optional acceleration only. Rebuild it from a [`StateSnapshot`],
+/// [`JsonlStateStore`], or JSONL file whenever the caller needs fresh indexed
+/// lookups. The JSONL state remains the correctness source of truth.
+#[cfg(feature = "sqlite-state-cache")]
+#[derive(Debug)]
+pub struct SqliteStateCache {
+    conn: Connection,
 }
 
 /// Rebuilt view of the append-only state log.
@@ -382,6 +395,143 @@ impl JsonlStateStore {
         Ok(())
     }
 }
+
+#[cfg(feature = "sqlite-state-cache")]
+impl SqliteStateCache {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        prepare_sqlite_cache_file(path)?;
+        let conn = open_sqlite_cache_connection(path)?;
+        let cache = Self { conn };
+        cache.initialize()?;
+        Ok(cache)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().map_err(sqlite_error)?;
+        let cache = Self { conn };
+        cache.initialize()?;
+        Ok(cache)
+    }
+
+    pub fn rebuild_from_jsonl(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        self.rebuild_from_locked_jsonl(path.as_ref(), Utc::now())
+    }
+
+    pub fn rebuild_from_store(&mut self, store: &JsonlStateStore) -> Result<()> {
+        self.rebuild_from_locked_jsonl(store.path(), Utc::now())
+    }
+
+    pub fn rebuild_from_snapshot(&mut self, snapshot: &StateSnapshot) -> Result<()> {
+        let tx = self.conn.transaction().map_err(sqlite_error)?;
+        tx.execute_batch(
+            "DELETE FROM processed_messages;\nDELETE FROM room_checkpoints;\nDELETE FROM metadata;",
+        )
+        .map_err(sqlite_error)?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+            params!["schema_version", "1"],
+        )
+        .map_err(sqlite_error)?;
+        {
+            let mut statement = tx
+                .prepare("INSERT INTO processed_messages(message_id) VALUES (?1)")
+                .map_err(sqlite_error)?;
+            for message_id in snapshot.processed_message_ids() {
+                statement
+                    .execute(params![message_id])
+                    .map_err(sqlite_error)?;
+            }
+        }
+        {
+            let mut statement = tx
+                .prepare("INSERT INTO room_checkpoints(room_id, checkpoint_json) VALUES (?1, ?2)")
+                .map_err(sqlite_error)?;
+            for checkpoint in snapshot.room_checkpoints() {
+                let checkpoint_json = serde_json::to_string(checkpoint)?;
+                statement
+                    .execute(params![checkpoint.room_id.as_str(), checkpoint_json])
+                    .map_err(sqlite_error)?;
+            }
+        }
+        tx.commit().map_err(sqlite_error)
+    }
+
+    pub fn contains_processed_message(&self, message_id: &str) -> Result<bool> {
+        ensure_message_id(message_id)?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM processed_messages WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error)?;
+        Ok(count > 0)
+    }
+
+    pub fn processed_message_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(1) FROM processed_messages", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_error)?;
+        u64::try_from(count)
+            .map_err(|_| Error::Other("processed message count is negative".to_owned()))
+    }
+
+    pub fn room_checkpoint(&self, room_id: &str) -> Result<Option<RoomCheckpoint>> {
+        if room_id.trim().is_empty() {
+            return Err(Error::Other("room checkpoint id is empty".to_owned()));
+        }
+        let checkpoint_json = self
+            .conn
+            .query_row(
+                "SELECT checkpoint_json FROM room_checkpoints WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        checkpoint_json
+            .map(|checkpoint_json| serde_json::from_str(&checkpoint_json).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn room_checkpoints(&self) -> Result<Vec<RoomCheckpoint>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT checkpoint_json FROM room_checkpoints ORDER BY room_id")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        let mut checkpoints = Vec::new();
+        for row in rows {
+            let checkpoint_json = row.map_err(sqlite_error)?;
+            checkpoints.push(serde_json::from_str(&checkpoint_json)?);
+        }
+        Ok(checkpoints)
+    }
+
+    fn initialize(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS metadata (\n    key TEXT PRIMARY KEY,\n    value TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS processed_messages (\n    message_id TEXT PRIMARY KEY\n);\nCREATE TABLE IF NOT EXISTS room_checkpoints (\n    room_id TEXT PRIMARY KEY,\n    checkpoint_json TEXT NOT NULL\n);",
+            )
+            .map_err(sqlite_error)
+    }
+
+    fn rebuild_from_locked_jsonl(&mut self, path: &Path, now: DateTime<Utc>) -> Result<()> {
+        let path = stable_state_path(path)?;
+        let _guard = StatePathLock::acquire(&path)?;
+        repair_incomplete_tail(&path, now)?;
+        let snapshot = StateSnapshot::load_at(&path, now)?;
+        self.rebuild_from_snapshot(&snapshot)
+    }
+}
+
 impl StateSnapshot {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         Self::load_at(path, Utc::now())
@@ -758,6 +908,138 @@ fn lease_expires_at(now: DateTime<Utc>, lease: Duration) -> Result<DateTime<Utc>
 fn remaining_lease(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<Duration> {
     let remaining = expires_at.signed_duration_since(now).to_std().ok()?;
     (!remaining.is_zero()).then_some(remaining)
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn open_sqlite_cache_connection(path: &Path) -> Result<Connection> {
+    reject_sqlite_uri_path(path)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
+    #[cfg(unix)]
+    set_existing_sqlite_cache_file_private(path)?;
+    Ok(conn)
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn reject_sqlite_uri_path(path: &Path) -> Result<()> {
+    let path_text = path.as_os_str().to_string_lossy();
+    if path_text
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        return Err(Error::Other(format!(
+            "sqlite state cache path {} must not use a file: URI",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn prepare_sqlite_cache_file(path: &Path) -> Result<()> {
+    reject_sqlite_uri_path(path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure_sqlite_cache_regular_file(path, &metadata)?;
+            #[cfg(unix)]
+            set_existing_sqlite_cache_file_private(path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_sqlite_cache_file(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn create_sqlite_cache_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    match options.open(path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            set_sqlite_cache_file_handle_private(&file)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)?;
+            ensure_sqlite_cache_regular_file(path, &metadata)?;
+            #[cfg(unix)]
+            set_existing_sqlite_cache_file_private(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn ensure_sqlite_cache_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::Other(format!(
+            "sqlite state cache path {} is a symbolic link",
+            path.display()
+        )));
+    }
+    if !file_type.is_file() {
+        return Err(Error::Other(format!(
+            "sqlite state cache path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn set_existing_sqlite_cache_file_private(path: &Path) -> Result<()> {
+    let file = File::open(path).or_else(|read_error| {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|_| read_error)
+    })?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    ensure_sqlite_cache_regular_file(path, &path_metadata)?;
+    let file_metadata = file.metadata()?;
+    if file_metadata.dev() != path_metadata.dev() || file_metadata.ino() != path_metadata.ino() {
+        return Err(Error::Other(format!(
+            "sqlite state cache path {} changed while opening",
+            path.display()
+        )));
+    }
+    set_sqlite_cache_file_handle_private(&file)
+}
+
+#[cfg(all(unix, feature = "sqlite-state-cache"))]
+fn set_sqlite_cache_file_handle_private(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut permissions = file.metadata()?.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-state-cache")]
+fn sqlite_error(error: rusqlite::Error) -> Error {
+    Error::Other(format!("sqlite state cache error: {error}"))
 }
 
 fn ensure_attempt_id(attempt_id: &str) -> Result<()> {
@@ -1282,6 +1564,268 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_repairs_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let db_path = temp_file("sqlite-cache-permissive-mode");
+        File::create(&db_path).unwrap();
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _cache = SqliteStateCache::open(&db_path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_repairs_existing_read_only_permissive_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let db_path = temp_file("sqlite-cache-readonly-mode");
+        File::create(&db_path).unwrap();
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let _cache = SqliteStateCache::open(&db_path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_rejects_existing_directory_without_chmod() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let db_path = temp_file("sqlite-cache-directory");
+        fs::create_dir(&db_path).unwrap();
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(SqliteStateCache::open(&db_path).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&db_path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir(db_path);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_rejects_uri_style_path() {
+        let target_path = temp_file("sqlite-cache-uri-target");
+        let uri_path = PathBuf::from(format!("file:{}?mode=rwc", target_path.display()));
+
+        assert!(SqliteStateCache::open(&uri_path).is_err());
+        assert!(!target_path.exists());
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_sqlite_open_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let target_path = temp_file("sqlite-cache-open-symlink-target");
+        let link_path = temp_file("sqlite-cache-open-symlink-link");
+        File::create(&target_path).unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        assert!(open_sqlite_cache_connection(&link_path).is_err());
+        assert_eq!(
+            fs::metadata(&target_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let _ = fs::remove_file(link_path);
+        let _ = fs::remove_file(target_path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_rejects_symlink_without_chmod_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let target_path = temp_file("sqlite-cache-symlink-target");
+        let link_path = temp_file("sqlite-cache-symlink-link");
+        File::create(&target_path).unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        assert!(SqliteStateCache::open(&link_path).is_err());
+        assert_eq!(
+            fs::metadata(&target_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let _ = fs::remove_file(link_path);
+        let _ = fs::remove_file(target_path);
+    }
+
+    #[cfg(all(unix, feature = "sqlite-state-cache"))]
+    #[test]
+    fn sqlite_state_cache_created_private_by_default() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let db_path = temp_file("sqlite-cache-mode");
+        let _cache = SqliteStateCache::open(&db_path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_rebuilds_from_store_snapshot() {
+        let state_path = temp_file("sqlite-cache-state");
+        let db_path = temp_file("sqlite-cache-db");
+        let mut store = JsonlStateStore::load_at(state_path.clone(), ts(1000)).unwrap();
+        let attempt = started_attempt(
+            store
+                .begin_attempt_at("message-1", Duration::from_secs(60), ts(1000))
+                .unwrap(),
+        );
+        store.mark_processed_at(&attempt, ts(1001)).unwrap();
+        store
+            .save_room_checkpoint_at(RoomCheckpoint::new("room-a", ["message-1"]), ts(1002))
+            .unwrap();
+        store
+            .save_room_checkpoint_at(RoomCheckpoint::known_empty("room-b"), ts(1003))
+            .unwrap();
+
+        let mut cache = SqliteStateCache::open(&db_path).unwrap();
+        cache.rebuild_from_store(&store).unwrap();
+
+        assert!(cache.contains_processed_message("message-1").unwrap());
+        assert!(!cache.contains_processed_message("message-2").unwrap());
+        assert_eq!(cache.processed_message_count().unwrap(), 1);
+        assert_eq!(
+            cache.room_checkpoint("room-a").unwrap(),
+            Some(RoomCheckpoint::new("room-a", ["message-1"]))
+        );
+        assert_eq!(
+            cache.room_checkpoint("room-b").unwrap(),
+            Some(RoomCheckpoint::known_empty("room-b"))
+        );
+        assert_eq!(cache.room_checkpoints().unwrap().len(), 2);
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_rebuild_replaces_stale_index() {
+        let mut cache = SqliteStateCache::open_in_memory().unwrap();
+        let state_path = temp_file("sqlite-cache-rebuild-jsonl");
+        let mut store = JsonlStateStore::load_at(state_path.clone(), ts(1000)).unwrap();
+        let attempt = started_attempt(
+            store
+                .begin_attempt_at("message-1", Duration::from_secs(60), ts(1000))
+                .unwrap(),
+        );
+        store.mark_processed_at(&attempt, ts(1001)).unwrap();
+        store
+            .save_room_checkpoint_at(RoomCheckpoint::new("room-a", ["message-1"]), ts(1002))
+            .unwrap();
+
+        cache.rebuild_from_jsonl(&state_path).unwrap();
+        assert!(cache.contains_processed_message("message-1").unwrap());
+        assert!(cache.room_checkpoint("room-a").unwrap().is_some());
+
+        cache
+            .rebuild_from_snapshot(&StateSnapshot::default())
+            .unwrap();
+        assert!(!cache.contains_processed_message("message-1").unwrap());
+        assert_eq!(cache.processed_message_count().unwrap(), 0);
+        assert!(cache.room_checkpoint("room-a").unwrap().is_none());
+        assert!(cache.room_checkpoints().unwrap().is_empty());
+
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_rebuild_from_store_reloads_latest_jsonl() {
+        let state_path = temp_file("sqlite-cache-stale-store");
+        let db_path = temp_file("sqlite-cache-stale-store-db");
+        let stale_store = JsonlStateStore::load_at(state_path.clone(), ts(1000)).unwrap();
+        let mut writer = JsonlStateStore::load_at(state_path.clone(), ts(1000)).unwrap();
+        let attempt = started_attempt(
+            writer
+                .begin_attempt_at("message-1", Duration::from_secs(60), ts(1000))
+                .unwrap(),
+        );
+        writer.mark_processed_at(&attempt, ts(1001)).unwrap();
+
+        let mut cache = SqliteStateCache::open(&db_path).unwrap();
+        cache.rebuild_from_store(&stale_store).unwrap();
+
+        assert!(cache.contains_processed_message("message-1").unwrap());
+        assert_eq!(cache.processed_message_count().unwrap(), 1);
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[cfg(feature = "sqlite-state-cache")]
+    #[test]
+    fn sqlite_state_cache_rebuild_from_jsonl_waits_for_state_path_lock() {
+        let state_path = temp_file("sqlite-cache-locked-state");
+        let mut store = JsonlStateStore::load_at(state_path.clone(), ts(1000)).unwrap();
+        let attempt = started_attempt(
+            store
+                .begin_attempt_at("message-1", Duration::from_secs(60), ts(1000))
+                .unwrap(),
+        );
+        store.mark_processed_at(&attempt, ts(1001)).unwrap();
+
+        let stable_path = stable_state_path(&state_path).unwrap();
+        let guard = StatePathLock::acquire(&stable_path).unwrap();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let thread_state_path = state_path.clone();
+        let handle = std::thread::spawn(move || {
+            let mut cache = SqliteStateCache::open_in_memory().unwrap();
+            started_sender.send(()).unwrap();
+            cache.rebuild_from_jsonl(&thread_state_path).unwrap();
+            done_sender
+                .send(cache.contains_processed_message("message-1").unwrap())
+                .unwrap();
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
+
+        drop(guard);
+
+        assert!(done_receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        handle.join().unwrap();
+
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]

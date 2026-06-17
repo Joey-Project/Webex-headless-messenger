@@ -16,6 +16,7 @@ httpdate = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = { version = "0.10", optional = true }
@@ -29,6 +30,7 @@ default = ["rustls-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 native-tls = ["reqwest/native-tls"]
 webhooks = ["dep:hex", "dep:hmac", "dep:sha1"]
+sqlite-state-cache = ["dep:rusqlite"]
 experimental-websocket = []
 
 [[example]]
