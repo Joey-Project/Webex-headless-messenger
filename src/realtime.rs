@@ -4,7 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::mpsc, task::JoinSet, time};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+use tokio::{sync::mpsc, time};
 use url::Url;
 
 use crate::{
@@ -295,6 +296,21 @@ pub struct MessagePoller {
     initialized: bool,
 }
 
+struct MessagePollUpdate {
+    messages: Vec<ListMessage>,
+    seen_ids: Vec<String>,
+    pending_fresh: Vec<ListMessage>,
+    pending_seen_ids: Vec<String>,
+    backlog_next: Option<Url>,
+    initialized: bool,
+    commit_seen: bool,
+}
+
+struct MessagePollError {
+    error: Error,
+    update: Option<MessagePollUpdate>,
+}
+
 impl MessagePoller {
     pub fn new(client: WebexClient, room_id: impl Into<String>) -> Self {
         Self {
@@ -334,21 +350,42 @@ impl MessagePoller {
     }
 
     pub async fn poll_once(&mut self) -> Result<Vec<ListMessage>> {
-        let mut page = if let Some(next) = self.backlog_next.clone() {
-            match self.client.next_page(next.clone()).await {
-                Ok(page) => {
-                    self.backlog_next = None;
-                    page
-                }
-                Err(error) => {
-                    self.backlog_next = Some(next);
-                    return Err(error);
-                }
+        match self.poll_once_transaction().await {
+            Ok(mut update) => {
+                let messages = std::mem::take(&mut update.messages);
+                self.apply_update(update);
+                Ok(messages)
             }
+            Err(error) => {
+                if let Some(update) = error.update {
+                    self.apply_update(update);
+                }
+                Err(error.error)
+            }
+        }
+    }
+
+    async fn poll_once_transaction(
+        &self,
+    ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
+        let mut page = if let Some(next) = self.backlog_next.clone() {
+            self.client
+                .next_page(next.clone())
+                .await
+                .map_err(|error| MessagePollError {
+                    error,
+                    update: None,
+                })?
         } else {
             let mut params = ListMessages::room(self.room_id.clone());
             params.max = Some(self.config.page_size);
-            self.client.list_messages(&params).await?
+            self.client
+                .list_messages(&params)
+                .await
+                .map_err(|error| MessagePollError {
+                    error,
+                    update: None,
+                })?
         };
         let max_pages = self.config.max_pages_per_poll.max(1);
 
@@ -369,50 +406,74 @@ impl MessagePoller {
                 fresh.len(),
                 new_ids.len(),
                 self.config.max_pending_messages,
-            )?;
+            )
+            .map_err(|error| MessagePollError {
+                error,
+                update: None,
+            })?;
 
             if saw_known_message && self.initialized {
-                self.backlog_next = None;
                 break;
             }
             let Some(next) = page.next.take() else {
-                self.backlog_next = None;
                 break;
             };
             if page_index + 1 >= max_pages {
                 if self.initialized || self.config.emit_existing_on_first_poll {
-                    self.pending_fresh = fresh;
-                    self.pending_seen_ids = new_ids;
-                    self.backlog_next = Some(next);
-                    self.initialized = true;
-                    return Ok(Vec::new());
+                    return Ok(MessagePollUpdate {
+                        messages: Vec::new(),
+                        seen_ids: Vec::new(),
+                        pending_fresh: fresh,
+                        pending_seen_ids: new_ids,
+                        backlog_next: Some(next),
+                        initialized: true,
+                        commit_seen: false,
+                    });
                 }
                 break;
             }
             page = match self.client.next_page(next.clone()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    if preserve_pending_on_page_error(
+                    let update = preserve_pending_on_page_error(
                         self.initialized,
                         self.config.emit_existing_on_first_poll,
-                    ) {
-                        self.pending_fresh = fresh;
-                        self.pending_seen_ids = new_ids;
-                        self.backlog_next = Some(next);
-                        self.initialized = true;
-                    }
-                    return Err(error);
+                    )
+                    .then_some(MessagePollUpdate {
+                        messages: Vec::new(),
+                        seen_ids: Vec::new(),
+                        pending_fresh: fresh,
+                        pending_seen_ids: new_ids,
+                        backlog_next: Some(next),
+                        initialized: true,
+                        commit_seen: false,
+                    });
+                    return Err(MessagePollError { error, update });
                 }
             };
         }
 
-        self.seen
-            .remember_newest_first(new_ids, self.config.max_seen_ids);
-        self.pending_fresh.clear();
-        self.pending_seen_ids.clear();
-        self.initialized = true;
         fresh.reverse();
-        Ok(fresh)
+        Ok(MessagePollUpdate {
+            messages: fresh,
+            seen_ids: new_ids,
+            pending_fresh: Vec::new(),
+            pending_seen_ids: Vec::new(),
+            backlog_next: None,
+            initialized: true,
+            commit_seen: true,
+        })
+    }
+
+    fn apply_update(&mut self, update: MessagePollUpdate) {
+        if update.commit_seen {
+            self.seen
+                .remember_newest_first(update.seen_ids, self.config.max_seen_ids);
+        }
+        self.pending_fresh = update.pending_fresh;
+        self.pending_seen_ids = update.pending_seen_ids;
+        self.backlog_next = update.backlog_next;
+        self.initialized = update.initialized;
     }
 
     pub fn spawn(mut self) -> mpsc::Receiver<Result<ListMessage>> {
@@ -450,7 +511,6 @@ impl MessagePoller {
     }
 }
 
-#[derive(Clone)]
 struct RoomPollerEntry {
     room: Room,
     poller: MessagePoller,
@@ -589,9 +649,9 @@ impl MultiRoomMessagePoller {
         messages.sort_by(compare_room_messages);
         let mut events = messages.into_iter().map(Ok).collect::<Vec<_>>();
         events.extend(errors);
-        for (room_id, entry) in room_batch.completed_entries {
+        for (room_id, update) in room_batch.completed_updates {
             if let Some(current) = self.rooms.get_mut(&room_id) {
-                *current = entry;
+                current.poller.apply_update(update);
             }
         }
         Ok(events)
@@ -601,60 +661,58 @@ impl MultiRoomMessagePoller {
         let timeout = self.config.room_poll_timeout;
         let max_concurrent = self.config.max_concurrent_room_polls.max(1);
         let mut remaining_rooms = self.rooms.iter();
-        let mut join_set = JoinSet::new();
+        let mut active_polls = FuturesUnordered::new();
         let mut events = Vec::new();
-        let mut completed_entries = Vec::new();
+        let mut completed_updates = Vec::new();
 
         for _ in 0..max_concurrent {
             let Some((room_id, entry)) = remaining_rooms.next() else {
                 break;
             };
-            spawn_room_poll(&mut join_set, room_id.clone(), entry.clone(), timeout);
+            active_polls.push(poll_room_entry(room_id, entry, timeout));
         }
 
-        while let Some(joined) = join_set.join_next().await {
-            match joined {
-                Ok((room_id, entry, poll_result)) => match poll_result {
-                    RoomPollResult::Completed(result) => {
-                        let room = entry.room.clone();
-                        completed_entries.push((room_id.clone(), entry));
-                        match result {
-                            Ok(room_messages) => {
-                                for message in room_messages {
-                                    events.push(Ok(RoomMessage {
-                                        room_id: room_id.clone(),
-                                        room: room.clone(),
-                                        message,
-                                    }));
-                                }
-                            }
-                            Err(source) => events.push(Err(Error::RoomPoll {
-                                room_id,
-                                source: Box::new(source),
-                            })),
+        while let Some((room_id, room, poll_result)) = active_polls.next().await {
+            match poll_result {
+                RoomPollResult::Completed(result) => match *result {
+                    Ok(mut update) => {
+                        let room_messages = std::mem::take(&mut update.messages);
+                        completed_updates.push((room_id.clone(), update));
+                        for message in room_messages {
+                            events.push(Ok(RoomMessage {
+                                room_id: room_id.clone(),
+                                room: room.clone(),
+                                message,
+                            }));
                         }
                     }
-                    RoomPollResult::TimedOut(timeout) => events.push(Err(Error::RoomPoll {
-                        room_id,
-                        source: Box::new(Error::Other(format!(
-                            "room poll timed out after {:?}",
-                            effective_poll_interval(timeout)
-                        ))),
-                    })),
+                    Err(error) => {
+                        if let Some(update) = error.update {
+                            completed_updates.push((room_id.clone(), update));
+                        }
+                        events.push(Err(Error::RoomPoll {
+                            room_id,
+                            source: Box::new(error.error),
+                        }));
+                    }
                 },
-                Err(error) => {
-                    events.push(Err(Error::Other(format!("room poll task failed: {error}"))))
-                }
+                RoomPollResult::TimedOut(timeout) => events.push(Err(Error::RoomPoll {
+                    room_id,
+                    source: Box::new(Error::Other(format!(
+                        "room poll timed out after {:?}",
+                        effective_poll_interval(timeout)
+                    ))),
+                })),
             }
 
             if let Some((room_id, entry)) = remaining_rooms.next() {
-                spawn_room_poll(&mut join_set, room_id.clone(), entry.clone(), timeout);
+                active_polls.push(poll_room_entry(room_id, entry, timeout));
             }
         }
 
         RoomPollBatch {
             events,
-            completed_entries,
+            completed_updates,
         }
     }
 
@@ -728,11 +786,11 @@ async fn discover_joined_rooms_with_timeout(
 
 struct RoomPollBatch {
     events: Vec<Result<RoomMessage>>,
-    completed_entries: Vec<(String, RoomPollerEntry)>,
+    completed_updates: Vec<(String, MessagePollUpdate)>,
 }
 
 enum RoomPollResult {
-    Completed(Result<Vec<ListMessage>>),
+    Completed(Box<std::result::Result<MessagePollUpdate, MessagePollError>>),
     TimedOut(Duration),
 }
 
@@ -766,24 +824,26 @@ fn prune_inactive_rooms(
     }
 }
 
-fn spawn_room_poll(
-    join_set: &mut JoinSet<(String, RoomPollerEntry, RoomPollResult)>,
-    room_id: String,
-    mut entry: RoomPollerEntry,
+async fn poll_room_entry(
+    room_id: &str,
+    entry: &RoomPollerEntry,
     timeout: Option<Duration>,
-) {
-    join_set.spawn(async move {
-        let result = poll_room_once(&mut entry.poller, timeout).await;
-        (room_id, entry, result)
-    });
+) -> (String, Room, RoomPollResult) {
+    let result = poll_room_once(&entry.poller, timeout).await;
+    (room_id.to_owned(), entry.room.clone(), result)
 }
 
-async fn poll_room_once(poller: &mut MessagePoller, timeout: Option<Duration>) -> RoomPollResult {
+async fn poll_room_once(poller: &MessagePoller, timeout: Option<Duration>) -> RoomPollResult {
     let Some(timeout) = timeout else {
-        return RoomPollResult::Completed(poller.poll_once().await);
+        return RoomPollResult::Completed(Box::new(poller.poll_once_transaction().await));
     };
-    match time::timeout(effective_poll_interval(timeout), poller.poll_once()).await {
-        Ok(result) => RoomPollResult::Completed(result),
+    match time::timeout(
+        effective_poll_interval(timeout),
+        poller.poll_once_transaction(),
+    )
+    .await
+    {
+        Ok(result) => RoomPollResult::Completed(Box::new(result)),
         Err(_) => RoomPollResult::TimedOut(timeout),
     }
 }

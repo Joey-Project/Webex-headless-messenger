@@ -1615,6 +1615,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "futures-util",
  "hex",
  "hmac",
  "httpdate",
