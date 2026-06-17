@@ -83,6 +83,9 @@ pub struct MultiRoomPollingConfig {
     pub room_poll_timeout: Option<Duration>,
     /// Maximum rooms polled concurrently. Values below 1 are treated as 1.
     pub max_concurrent_room_polls: usize,
+    /// Maximum inactive room poller states retained for rooms that disappear from discovery.
+    /// Values below 1 are treated as 1.
+    pub max_inactive_rooms: usize,
 }
 
 impl Default for MultiRoomPollingConfig {
@@ -94,6 +97,7 @@ impl Default for MultiRoomPollingConfig {
             room_discovery_timeout: Some(Duration::from_secs(60)),
             room_poll_timeout: Some(Duration::from_secs(60)),
             max_concurrent_room_polls: 16,
+            max_inactive_rooms: 1_000,
         }
     }
 }
@@ -458,6 +462,7 @@ pub struct MultiRoomMessagePoller {
     config: MultiRoomPollingConfig,
     rooms: BTreeMap<String, RoomPollerEntry>,
     inactive_rooms: BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: VecDeque<String>,
     checkpoints: BTreeMap<String, Vec<String>>,
     rooms_initialized: bool,
     last_room_discovery: Option<Instant>,
@@ -470,6 +475,7 @@ impl MultiRoomMessagePoller {
             config: MultiRoomPollingConfig::default(),
             rooms: BTreeMap::new(),
             inactive_rooms: BTreeMap::new(),
+            inactive_room_order: VecDeque::new(),
             checkpoints: BTreeMap::new(),
             rooms_initialized: false,
             last_room_discovery: None,
@@ -507,6 +513,7 @@ impl MultiRoomMessagePoller {
         let discovered = discovered?;
         let mut next_rooms: BTreeMap<String, RoomPollerEntry> = BTreeMap::new();
         let mut next_inactive_rooms = std::mem::take(&mut self.inactive_rooms);
+        let mut next_inactive_room_order = std::mem::take(&mut self.inactive_room_order);
         for room in discovered.iter().cloned() {
             let Some(room_id) = room.id.clone() else {
                 continue;
@@ -519,6 +526,7 @@ impl MultiRoomMessagePoller {
                 existing.room = room;
                 next_rooms.insert(room_id, existing);
             } else if let Some(mut existing) = next_inactive_rooms.remove(&room_id) {
+                next_inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
                 existing.room = room;
                 next_rooms.insert(room_id, existing);
             } else {
@@ -530,9 +538,22 @@ impl MultiRoomMessagePoller {
                 next_rooms.insert(room_id, RoomPollerEntry { room, poller });
             }
         }
-        next_inactive_rooms.append(&mut self.rooms);
+        for (room_id, entry) in std::mem::take(&mut self.rooms) {
+            remember_inactive_room(
+                &mut next_inactive_rooms,
+                &mut next_inactive_room_order,
+                room_id,
+                entry,
+            );
+        }
+        prune_inactive_rooms(
+            &mut next_inactive_rooms,
+            &mut next_inactive_room_order,
+            self.config.max_inactive_rooms,
+        );
         self.rooms = next_rooms;
         self.inactive_rooms = next_inactive_rooms;
+        self.inactive_room_order = next_inactive_room_order;
         self.rooms_initialized = true;
         Ok(discovered)
     }
@@ -713,6 +734,36 @@ struct RoomPollBatch {
 enum RoomPollResult {
     Completed(Result<Vec<ListMessage>>),
     TimedOut(Duration),
+}
+
+fn remember_inactive_room(
+    inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: &mut VecDeque<String>,
+    room_id: String,
+    entry: RoomPollerEntry,
+) {
+    inactive_rooms.insert(room_id.clone(), entry);
+    inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
+    inactive_room_order.push_back(room_id);
+}
+
+fn prune_inactive_rooms(
+    inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: &mut VecDeque<String>,
+    max_inactive_rooms: usize,
+) {
+    let limit = max_inactive_rooms.max(1);
+    inactive_room_order.retain(|room_id| inactive_rooms.contains_key(room_id));
+    while inactive_rooms.len() > limit {
+        let Some(room_id) = inactive_room_order.pop_front() else {
+            let Some(room_id) = inactive_rooms.keys().next().cloned() else {
+                break;
+            };
+            inactive_rooms.remove(&room_id);
+            continue;
+        };
+        inactive_rooms.remove(&room_id);
+    }
 }
 
 fn spawn_room_poll(
@@ -1209,6 +1260,36 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[4].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_prunes_inactive_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-c","title":"Room C"}]}"#),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client).with_config(MultiRoomPollingConfig {
+            max_inactive_rooms: 1,
+            ..MultiRoomPollingConfig::default()
+        });
+
+        poller.refresh_rooms().await.unwrap();
+        poller.refresh_rooms().await.unwrap();
+        poller.refresh_rooms().await.unwrap();
+
+        assert_eq!(poller.room_ids(), ["room-c"]);
+        assert_eq!(
+            poller.inactive_rooms.keys().cloned().collect::<Vec<_>>(),
+            ["room-b"]
+        );
+        assert_eq!(
+            poller.inactive_room_order,
+            VecDeque::from(["room-b".to_owned()])
+        );
+        assert_eq!(requests.await.unwrap().len(), 3);
     }
 
     #[tokio::test]
