@@ -52,7 +52,10 @@ fn rest_room_id_from_space_uuid(value: &str) -> Option<String> {
     if !is_hyphenated_uuid_like(value) {
         return None;
     }
-    Some(STANDARD.encode(format!("ciscospark://us/ROOM/{value}")))
+    Some(STANDARD.encode(format!(
+        "ciscospark://us/ROOM/{}",
+        value.to_ascii_lowercase()
+    )))
 }
 
 fn is_hyphenated_uuid_like(value: &str) -> bool {
@@ -96,5 +99,17 @@ mod tests {
             Some("Y2lzY29zcGFyazovL3VzL1JPT00vZWU1ZmMzZjAtNjAzNi0xMWYxLTgyMjMtZjkwY2M2YWQ0ZTcw")
         );
         assert!(candidates.contains(&"ee5fc3f0-6036-11f1-8223-f90cc6ad4e70".to_owned()));
+    }
+
+    #[test]
+    fn normalizes_uppercase_space_uuid_before_deriving_rest_room_id() {
+        let candidates = room_id_candidates_from_link(
+            "webexteams://im?space=EE5FC3F0-6036-11F1-8223-F90CC6AD4E70",
+        );
+
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("Y2lzY29zcGFyazovL3VzL1JPT00vZWU1ZmMzZjAtNjAzNi0xMWYxLTgyMjMtZjkwY2M2YWQ0ZTcw")
+        );
     }
 }
