@@ -469,11 +469,15 @@ impl MultiRoomMessagePoller {
         .await;
         self.last_room_discovery = Some(Instant::now());
         let discovered = discovered?;
-        let mut next_rooms = BTreeMap::new();
+        let mut next_rooms: BTreeMap<String, RoomPollerEntry> = BTreeMap::new();
         for room in discovered.iter().cloned() {
             let Some(room_id) = room.id.clone() else {
                 continue;
             };
+            if let Some(existing) = next_rooms.get_mut(&room_id) {
+                existing.room = room;
+                continue;
+            }
             if let Some(mut existing) = self.rooms.remove(&room_id) {
                 existing.room = room;
                 next_rooms.insert(room_id, existing);
@@ -943,6 +947,42 @@ mod tests {
                 .contains("joined-room discovery exceeded max_rooms=1")
         );
         assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_deduplicates_discovery_without_losing_checkpoint() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-a","title":"Room A Updated"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let events = poller.poll_once().await.unwrap();
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(poller.room_ids(), ["room-a"]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(messages[0].room.title.as_deref(), Some("Room A Updated"));
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("roomId=room-a"));
     }
 
     #[tokio::test]
