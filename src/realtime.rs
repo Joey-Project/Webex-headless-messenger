@@ -115,6 +115,7 @@ pub struct RoomCheckpoint {
     pub room_id: String,
     pub seen_message_ids: Vec<String>,
     /// Initialize the room even when the seed list is empty.
+    #[serde(default)]
     pub initialize_empty: bool,
 }
 
@@ -1426,6 +1427,17 @@ mod tests {
             serde_json::from_value::<RoomCheckpoint>(value).unwrap(),
             checkpoint
         );
+    }
+
+    #[test]
+    fn room_checkpoint_defaults_missing_initialize_empty_to_false() {
+        let checkpoint = serde_json::from_value::<RoomCheckpoint>(json!({
+            "room_id": "room-a",
+            "seen_message_ids": ["newest"],
+        }))
+        .unwrap();
+
+        assert_eq!(checkpoint, RoomCheckpoint::new("room-a", ["newest"]));
     }
 
     #[test]
