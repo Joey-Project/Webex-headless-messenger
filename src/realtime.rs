@@ -393,6 +393,20 @@ impl MessagePoller {
     async fn poll_once_transaction(
         &self,
     ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
+        if self.backlog_next.is_none() && !self.pending_fresh.is_empty() {
+            let mut fresh = self.pending_fresh.clone();
+            fresh.reverse();
+            return Ok(MessagePollUpdate {
+                messages: fresh,
+                seen_ids: self.pending_seen_ids.clone(),
+                pending_fresh: Vec::new(),
+                pending_seen_ids: Vec::new(),
+                backlog_next: None,
+                initialized: true,
+                commit_seen: true,
+            });
+        }
+
         let mut page = if let Some(next) = self.backlog_next.clone() {
             self.client
                 .next_page(next.clone())
@@ -695,9 +709,13 @@ impl MultiRoomMessagePoller {
             messages.into_iter().map(Ok).collect::<Vec<_>>()
         };
         events.extend(errors);
-        for (room_id, update, update_has_messages) in room_batch.completed_updates {
-            if room_batch.has_pending_backlog && update.commit_seen && update_has_messages {
-                continue;
+        for (room_id, mut update) in room_batch.completed_updates {
+            if room_batch.has_pending_backlog && update.commit_seen && !update.messages.is_empty() {
+                let mut pending_fresh = std::mem::take(&mut update.messages);
+                pending_fresh.reverse();
+                update.pending_fresh = pending_fresh;
+                update.pending_seen_ids = std::mem::take(&mut update.seen_ids);
+                update.commit_seen = false;
             }
             if let Some(current) = self.rooms.get_mut(&room_id) {
                 current.poller.apply_update(update);
@@ -727,20 +745,18 @@ impl MultiRoomMessagePoller {
         {
             match poll_result {
                 RoomPollResult::Completed(result) => match *result {
-                    Ok(mut update) => {
+                    Ok(update) => {
                         if !update.commit_seen {
                             has_pending_backlog = true;
                         }
-                        let room_messages = std::mem::take(&mut update.messages);
-                        let update_has_messages = !room_messages.is_empty();
-                        completed_updates.push((room_id.clone(), update, update_has_messages));
-                        for message in room_messages {
+                        for message in update.messages.iter().cloned() {
                             events.push(Ok(RoomMessage {
                                 room_id: room_id.clone(),
                                 room: room.clone(),
                                 message,
                             }));
                         }
+                        completed_updates.push((room_id.clone(), update));
                     }
                     Err(error) => {
                         let mut preserved_update = false;
@@ -749,8 +765,7 @@ impl MultiRoomMessagePoller {
                             if !update.commit_seen {
                                 has_pending_backlog = true;
                             }
-                            let update_has_messages = !update.messages.is_empty();
-                            completed_updates.push((room_id.clone(), update, update_has_messages));
+                            completed_updates.push((room_id.clone(), update));
                         }
                         if had_pending_backlog && !preserved_update {
                             has_pending_backlog = true;
@@ -776,9 +791,6 @@ impl MultiRoomMessagePoller {
             }
 
             if let Some((room_id, entry)) = remaining_rooms.next() {
-                if entry.poller.has_pending_backlog() {
-                    has_pending_backlog = true;
-                }
                 active_polls.push(poll_room_entry(room_id, entry, timeout));
             }
         }
@@ -860,7 +872,7 @@ async fn discover_joined_rooms_with_timeout(
 
 struct RoomPollBatch {
     events: Vec<Result<RoomMessage>>,
-    completed_updates: Vec<(String, MessagePollUpdate, bool)>,
+    completed_updates: Vec<(String, MessagePollUpdate)>,
     has_pending_backlog: bool,
 }
 
@@ -1531,9 +1543,6 @@ mod tests {
                 MockResponse::json(
                     r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
-                MockResponse::json(
-                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
-                ),
             ]
         })
         .await;
@@ -1570,11 +1579,10 @@ mod tests {
         );
 
         let requests = requests.await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].starts_with("GET /v1/messages?page=2"));
-        assert!(requests[4].contains("roomId=room-b"));
     }
 
     #[tokio::test]
@@ -1597,13 +1605,7 @@ mod tests {
                     r#"{"message":"room a unavailable"}"#,
                 ),
                 MockResponse::json(
-                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
-                ),
-                MockResponse::json(
                     r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
-                ),
-                MockResponse::json(
-                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
             ]
         })
@@ -1648,13 +1650,11 @@ mod tests {
         );
 
         let requests = requests.await.unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 5);
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].starts_with("GET /v1/messages?page=2"));
-        assert!(requests[4].contains("roomId=room-b"));
-        assert!(requests[5].starts_with("GET /v1/messages?page=2"));
-        assert!(requests[6].contains("roomId=room-b"));
+        assert!(requests[4].starts_with("GET /v1/messages?page=2"));
     }
 
     #[tokio::test]
