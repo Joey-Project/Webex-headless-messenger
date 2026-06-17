@@ -336,15 +336,24 @@ async fn main() -> webex_headless_messenger::Result<()> {
 
     while let Some(batch) = batches.recv().await {
         let batch = batch?;
-        for event in &batch.events {
-            match event {
-                Ok(room_message) => {
-                    println!("{} {:?}", room_message.room_id, room_message.message.text);
-                }
-                Err(error) => {
-                    eprintln!("recoverable multi-room poll error: {error}");
-                }
+        let errors = batch
+            .events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            for error in errors {
+                eprintln!("recoverable multi-room poll error: {error}");
             }
+            // Strict recovery path: do not handle successful events or persist
+            // checkpoints from this partial batch. Drop this poller and rebuild
+            // from the last durable checkpoints before retrying.
+            break;
+        }
+
+        for event in &batch.events {
+            let room_message = event.as_ref().expect("errors handled above");
+            println!("{} {:?}", room_message.room_id, room_message.message.text);
         }
         for checkpoint in &batch.checkpoints {
             // Persist the whole checkpoint only after handling the batch events above.

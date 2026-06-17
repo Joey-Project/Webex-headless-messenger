@@ -2852,10 +2852,11 @@ mod tests {
             .with_config(config.clone())
             .with_room_checkpoints(checkpoints.clone());
 
-        let first_events = first.poll_once().await.unwrap().events;
+        let first_batch = first.poll_once().await.unwrap();
 
         assert_eq!(
-            first_events
+            first_batch
+                .events
                 .iter()
                 .filter_map(|event| event.as_ref().ok())
                 .map(|message| message.message.id.as_deref().unwrap())
@@ -2863,12 +2864,15 @@ mod tests {
             ["a-new"]
         );
         assert_eq!(
-            first_events
+            first_batch
+                .events
                 .iter()
                 .filter_map(|event| event.as_ref().err())
                 .count(),
             1
         );
+        assert_eq!(first_batch.checkpoints.len(), 1);
+        assert_eq!(first_batch.checkpoints[0].room_id, "room-a");
 
         let mut rebuilt = MultiRoomMessagePoller::new(client_for(base_url))
             .with_config(config)
