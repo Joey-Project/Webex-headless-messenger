@@ -8,6 +8,9 @@ use thiserror::Error as ThisError;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors returned by the Webex client and OAuth helpers.
+///
+/// This enum is non-exhaustive so the crate can add structured errors as new
+/// Webex surfaces are wrapped.
 #[derive(Debug, ThisError)]
 #[non_exhaustive]
 pub enum Error {

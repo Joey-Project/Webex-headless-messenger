@@ -375,6 +375,24 @@ impl MessagePoller {
         }
     }
 
+    fn replace_checkpoint(&mut self, seen_ids: Vec<String>, initialize_empty: bool) {
+        self.seen = SeenMessageIds::default();
+        self.backlog_next = None;
+        self.pending_fresh.clear();
+        self.pending_seen_ids.clear();
+        self.initialized = false;
+        self.seed_seen_message_ids = None;
+        if seen_ids.is_empty() {
+            if initialize_empty {
+                self.initialized = true;
+            }
+        } else {
+            self.seed_seen_message_ids = Some(seen_ids.clone());
+            self.reseed_seen_message_ids(seen_ids);
+            self.initialized = true;
+        }
+    }
+
     /// Seed the in-memory de-duplication boundary from durable state.
     ///
     /// Seed IDs should be ordered newest-first when the list is bounded.
@@ -659,11 +677,15 @@ impl MultiRoomMessagePoller {
         self
     }
 
+    /// Seed durable checkpoints for rooms that have not yet emitted checkpoints.
+    ///
+    /// Matching active or inactive room pollers are reseeded immediately. Any
+    /// remaining checkpoints are retained for rooms discovered later.
     pub fn with_room_checkpoints<I>(mut self, checkpoints: I) -> Self
     where
         I: IntoIterator<Item = RoomCheckpoint>,
     {
-        self.checkpoints = checkpoints
+        let mut checkpoints = checkpoints
             .into_iter()
             .map(|checkpoint| {
                 (
@@ -671,7 +693,18 @@ impl MultiRoomMessagePoller {
                     (checkpoint.seen_message_ids, checkpoint.initialize_empty),
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        for (room_id, entry) in self.rooms.iter_mut() {
+            if let Some((seen_ids, initialize_empty)) = checkpoints.remove(room_id) {
+                entry.poller.replace_checkpoint(seen_ids, initialize_empty);
+            }
+        }
+        for (room_id, entry) in self.inactive_rooms.iter_mut() {
+            if let Some((seen_ids, initialize_empty)) = checkpoints.remove(room_id) {
+                entry.poller.replace_checkpoint(seen_ids, initialize_empty);
+            }
+        }
+        self.checkpoints = checkpoints;
         self
     }
 
@@ -1815,6 +1848,31 @@ mod tests {
         assert!(requests[3].starts_with("GET /v1/rooms?"));
         assert!(requests[4].starts_with("GET /v1/rooms?"));
         assert!(requests[5].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_applies_checkpoint_after_room_discovery() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client);
+
+        poller.refresh_rooms().await.unwrap();
+        let mut poller = poller.with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+        let events = poller.poll_once().await.unwrap().events;
+
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap().message.id.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["a-new"]);
+        assert!(!poller.checkpoints.contains_key("room-a"));
+        assert_eq!(requests.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
