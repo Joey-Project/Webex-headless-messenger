@@ -14,6 +14,7 @@ pub mod pagination;
 pub mod realtime;
 pub mod rooms;
 pub mod sidecar;
+pub mod state;
 pub mod types;
 pub mod webhooks;
 
@@ -31,6 +32,10 @@ pub use realtime::{
 };
 pub use rooms::room_id_candidates_from_link;
 pub use sidecar::SidecarEvent;
+pub use state::{
+    AttemptLease, AttemptLeaseStatus, AttemptStart, JsonlStateStore, StateEvent, StateRecord,
+    StateSnapshot,
+};
 
 #[cfg(feature = "experimental-websocket")]
 pub mod experimental_websocket {
