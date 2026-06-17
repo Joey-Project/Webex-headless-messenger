@@ -283,18 +283,19 @@ Polling is intentionally conservative. It de-duplicates by message ID in memory
 and skips existing messages on the first poll by default.
 
 For generic-account services that must recover gaps across every joined space,
-use `discover_joined_rooms` or `MultiRoomMessagePoller`. Seed
-`RoomCheckpoint` with newest-first message IDs from durable state for rooms that
-were processed before restart; newly discovered rooms without checkpoints only
+use `discover_joined_rooms` or `MultiRoomMessagePoller`. Persist and restore the
+whole `RoomCheckpoint`, including `initialize_empty`; `seen_message_ids` are
+newest-first when present. Newly discovered rooms without checkpoints only
 establish a baseline on their first poll. Direct `poll_once` calls, `spawn`,
 and `spawn_batches` return per-room events plus `RoomCheckpoint` updates for
-durable state, so one failing room does not block catch-up for other rooms.
-`MultiRoomMessagePoller` bounds discovery and room polling with
-`room_discovery_timeout`,
-`room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by
-default. Inactive rooms with pending backlog are retained above the inactive
-limit until they reappear and drain, but they do not block delivery for
-currently visible rooms.
+durable state. Per-room failures without active pending backlog are emitted as
+recoverable errors so other rooms can continue; when an active room still has
+pending backlog, successful messages are held until the backlog drains to
+preserve chronological catch-up order. `MultiRoomMessagePoller` bounds discovery
+and room polling with `room_discovery_timeout`, `room_poll_timeout`,
+`max_concurrent_room_polls`, and `max_inactive_rooms` by default. Inactive rooms
+with pending backlog are retained above the inactive limit until they reappear
+and drain, but they do not block delivery for currently visible rooms.
 
 ```rust
 use std::time::Duration;
@@ -333,8 +334,8 @@ async fn main() -> webex_headless_messenger::Result<()> {
             }
         }
         for checkpoint in &batch.checkpoints {
-            // Persist this checkpoint only after handling the batch events above.
-            eprintln!("checkpoint {} {:?}", checkpoint.room_id, checkpoint.seen_message_ids);
+            // Persist the whole checkpoint only after handling the batch events above.
+            eprintln!("checkpoint {:?}", checkpoint);
         }
     }
 
