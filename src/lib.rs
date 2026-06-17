@@ -12,6 +12,7 @@ pub mod client;
 pub mod error;
 pub mod pagination;
 pub mod realtime;
+pub mod rooms;
 pub mod sidecar;
 pub mod types;
 pub mod webhooks;
@@ -25,6 +26,7 @@ pub use client::{ClientBuilder, WebexClient};
 pub use error::{ApiError, Error, Result};
 pub use pagination::Page;
 pub use realtime::{MessagePoller, PollingConfig};
+pub use rooms::room_id_candidates_from_link;
 pub use sidecar::SidecarEvent;
 
 #[cfg(feature = "experimental-websocket")]

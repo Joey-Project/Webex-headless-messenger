@@ -22,11 +22,11 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::{sleep, timeout},
 };
-use url::Url;
 use webex_headless_messenger::{
     DEFAULT_MESSAGING_SCOPES, DeviceTokenStatus, MessagePoller, OAuthClient, OAuthConfig,
     PollingConfig, RefreshingTokenProvider, SidecarEvent, TokenSet, TokenStore, WebexClient,
     error::{Error as WebexError, Result as WebexResult},
+    room_id_candidates_from_link,
     types::{
         CreateMessage, ListDirectMessages, ListMessages, ListRooms, LocalFileAttachment, Room,
     },
@@ -1523,47 +1523,6 @@ async fn resolve_room(client: &WebexClient, args: RoomsResolveArgs) -> CliResult
     }
 }
 
-fn room_id_candidates_from_link(link: &str) -> Vec<String> {
-    let Ok(url) = Url::parse(link.trim()) else {
-        return Vec::new();
-    };
-    let mut candidates = Vec::new();
-    for segment in url.path_segments().into_iter().flatten() {
-        push_room_candidate(&mut candidates, segment);
-    }
-    for (key, value) in url.query_pairs() {
-        if key_contains_room_hint(&key) {
-            push_room_candidate(&mut candidates, &value);
-        }
-    }
-    if let Some(fragment) = url.fragment() {
-        for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
-            if key_contains_room_hint(&key) {
-                push_room_candidate(&mut candidates, &value);
-            }
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn key_contains_room_hint(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key == "id" || key.contains("room") || key.contains("space") || key.contains("conversation")
-}
-
-fn push_room_candidate(candidates: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if value.len() >= 16
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '/' | '='))
-    {
-        candidates.push(value.to_owned());
-    }
-}
-
 async fn poll_messages(client: WebexClient, args: PollMessagesArgs) -> CliResult<()> {
     let config = PollingConfig {
         interval: Duration::from_secs(args.interval_seconds),
@@ -1974,16 +1933,6 @@ mod tests {
                 "spark:kms".to_owned()
             ]
         );
-    }
-
-    #[test]
-    fn parses_room_link_candidates_from_query_and_fragment() {
-        let candidates = room_id_candidates_from_link(
-            "https://web.webex.com/rooms?id=Y2lzY29zcGFyazovL3VzL1JPT00vabc#spaceId=room-1234567890123456",
-        );
-
-        assert!(candidates.contains(&"Y2lzY29zcGFyazovL3VzL1JPT00vabc".to_owned()));
-        assert!(candidates.contains(&"room-1234567890123456".to_owned()));
     }
 
     #[test]
