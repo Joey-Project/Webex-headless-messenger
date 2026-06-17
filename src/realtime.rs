@@ -257,8 +257,10 @@ async fn poll_tick_or_receiver_open<T>(
     if sender.is_closed() {
         return false;
     }
-    interval.tick().await;
-    !sender.is_closed()
+    tokio::select! {
+        _ = sender.closed() => false,
+        _ = interval.tick() => true,
+    }
 }
 
 fn ensure_pending_within_limit(
@@ -451,6 +453,7 @@ pub struct MultiRoomMessagePoller {
     client: WebexClient,
     config: MultiRoomPollingConfig,
     rooms: BTreeMap<String, RoomPollerEntry>,
+    inactive_rooms: BTreeMap<String, RoomPollerEntry>,
     checkpoints: BTreeMap<String, Vec<String>>,
     rooms_initialized: bool,
     last_room_discovery: Option<Instant>,
@@ -462,6 +465,7 @@ impl MultiRoomMessagePoller {
             client,
             config: MultiRoomPollingConfig::default(),
             rooms: BTreeMap::new(),
+            inactive_rooms: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             rooms_initialized: false,
             last_room_discovery: None,
@@ -498,6 +502,7 @@ impl MultiRoomMessagePoller {
         self.last_room_discovery = Some(Instant::now());
         let discovered = discovered?;
         let mut next_rooms: BTreeMap<String, RoomPollerEntry> = BTreeMap::new();
+        let mut next_inactive_rooms = std::mem::take(&mut self.inactive_rooms);
         for room in discovered.iter().cloned() {
             let Some(room_id) = room.id.clone() else {
                 continue;
@@ -509,6 +514,9 @@ impl MultiRoomMessagePoller {
             if let Some(mut existing) = self.rooms.remove(&room_id) {
                 existing.room = room;
                 next_rooms.insert(room_id, existing);
+            } else if let Some(mut existing) = next_inactive_rooms.remove(&room_id) {
+                existing.room = room;
+                next_rooms.insert(room_id, existing);
             } else {
                 let mut poller = MessagePoller::new(self.client.clone(), room_id.clone())
                     .with_config(self.config.room_polling.clone());
@@ -518,7 +526,9 @@ impl MultiRoomMessagePoller {
                 next_rooms.insert(room_id, RoomPollerEntry { room, poller });
             }
         }
+        next_inactive_rooms.append(&mut self.rooms);
         self.rooms = next_rooms;
+        self.inactive_rooms = next_inactive_rooms;
         self.rooms_initialized = true;
         Ok(discovered)
     }
@@ -565,12 +575,7 @@ impl MultiRoomMessagePoller {
     async fn poll_rooms_concurrently(&self) -> RoomPollBatch {
         let timeout = self.config.room_poll_timeout;
         let max_concurrent = self.config.max_concurrent_room_polls.max(1);
-        let mut remaining_rooms = self
-            .rooms
-            .iter()
-            .map(|(room_id, entry)| (room_id.clone(), entry.clone()))
-            .collect::<VecDeque<_>>()
-            .into_iter();
+        let mut remaining_rooms = self.rooms.iter();
         let mut join_set = JoinSet::new();
         let mut events = Vec::new();
         let mut completed_entries = Vec::new();
@@ -579,7 +584,7 @@ impl MultiRoomMessagePoller {
             let Some((room_id, entry)) = remaining_rooms.next() else {
                 break;
             };
-            spawn_room_poll(&mut join_set, room_id, entry, timeout);
+            spawn_room_poll(&mut join_set, room_id.clone(), entry.clone(), timeout);
         }
 
         while let Some(joined) = join_set.join_next().await {
@@ -618,7 +623,7 @@ impl MultiRoomMessagePoller {
             }
 
             if let Some((room_id, entry)) = remaining_rooms.next() {
-                spawn_room_poll(&mut join_set, room_id, entry, timeout);
+                spawn_room_poll(&mut join_set, room_id.clone(), entry.clone(), timeout);
             }
         }
 
@@ -1051,6 +1056,65 @@ mod tests {
         let requests = requests.await.unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_restores_state_when_room_reappears() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A Restored"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let first_events = poller.poll_once().await.unwrap();
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+
+        let missing_events = poller.poll_once().await.unwrap();
+        assert!(missing_events.is_empty());
+        assert!(poller.room_ids().is_empty());
+
+        let restored_events = poller.poll_once().await.unwrap();
+        let restored_messages = restored_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert_eq!(
+            restored_messages[0].room.title.as_deref(),
+            Some("Room A Restored")
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[4].contains("roomId=room-a"));
     }
 
     #[tokio::test]
