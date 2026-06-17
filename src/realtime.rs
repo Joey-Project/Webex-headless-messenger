@@ -6,6 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time};
 use url::Url;
 
@@ -109,7 +110,7 @@ impl Default for MultiRoomPollingConfig {
 /// A durable checkpoint seed for one room.
 ///
 /// `seen_message_ids` should be ordered newest-first when the list is bounded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomCheckpoint {
     pub room_id: String,
     pub seen_message_ids: Vec<String>,
@@ -229,12 +230,17 @@ impl SeenMessageIds {
                 self.order.push_front(id);
             }
 
-            while self.ids.len() > max_ids {
-                if let Some(stale) = self.order.pop_back() {
-                    self.ids.remove(&stale);
-                } else {
-                    break;
-                }
+            self.truncate(max_ids);
+        }
+    }
+
+    fn truncate(&mut self, max_ids: usize) {
+        let max_ids = max_ids.max(1);
+        while self.ids.len() > max_ids {
+            if let Some(stale) = self.order.pop_back() {
+                self.ids.remove(&stale);
+            } else {
+                break;
             }
         }
     }
@@ -356,11 +362,17 @@ impl MessagePoller {
     }
 
     pub fn with_config(mut self, config: PollingConfig) -> Self {
+        self.set_config(config);
+        self
+    }
+
+    fn set_config(&mut self, config: PollingConfig) {
         self.config = config;
         if let Some(ids) = self.seed_seen_message_ids.clone() {
             self.reseed_seen_message_ids(ids);
+        } else {
+            self.seen.truncate(self.config.max_seen_ids);
         }
-        self
     }
 
     /// Seed the in-memory de-duplication boundary from durable state.
@@ -636,7 +648,14 @@ impl MultiRoomMessagePoller {
     }
 
     pub fn with_config(mut self, config: MultiRoomPollingConfig) -> Self {
+        let room_polling = config.room_polling.clone();
         self.config = config;
+        for entry in self.rooms.values_mut() {
+            entry.poller.set_config(room_polling.clone());
+        }
+        for entry in self.inactive_rooms.values_mut() {
+            entry.poller.set_config(room_polling.clone());
+        }
         self
     }
 
@@ -1106,6 +1125,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1121,8 +1141,8 @@ mod tests {
     };
 
     use super::{
-        MessagePoller, MultiRoomMessagePoller, MultiRoomPollingConfig, PollingConfig,
-        RoomCheckpoint, RoomDiscoveryConfig, RoomPollerEntry, SeenMessageIds,
+        MessagePollUpdate, MessagePoller, MultiRoomMessagePoller, MultiRoomPollingConfig,
+        PollingConfig, RoomCheckpoint, RoomDiscoveryConfig, RoomPollerEntry, SeenMessageIds,
         collect_page_messages, discover_joined_rooms, effective_poll_interval,
         ensure_pending_within_limit, poll_tick_or_receiver_open, preserve_pending_on_page_error,
         prune_inactive_rooms,
@@ -1354,6 +1374,104 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v1/rooms?"));
         assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[test]
+    fn room_checkpoint_with_seen_ids_round_trips_through_json() {
+        let checkpoint = RoomCheckpoint::new("room-a", ["newest", "older"]);
+        let value = serde_json::to_value(&checkpoint).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "room_id": "room-a",
+                "seen_message_ids": ["newest", "older"],
+                "initialize_empty": false,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RoomCheckpoint>(value).unwrap(),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn room_checkpoint_known_empty_round_trips_through_json() {
+        let checkpoint = RoomCheckpoint::known_empty("room-a");
+        let value = serde_json::to_value(&checkpoint).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "room_id": "room-a",
+                "seen_message_ids": [],
+                "initialize_empty": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RoomCheckpoint>(value).unwrap(),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn multi_room_poller_with_config_updates_existing_room_pollers() {
+        let old_room_polling = PollingConfig {
+            page_size: 1,
+            max_seen_ids: 3,
+            ..PollingConfig::default()
+        };
+        let new_room_polling = PollingConfig {
+            page_size: 7,
+            max_seen_ids: 1,
+            ..PollingConfig::default()
+        };
+        let mut active_poller = MessagePoller::new(dummy_client(), "room-a")
+            .with_config(old_room_polling.clone())
+            .with_seen_message_ids(["a-newer", "a-middle", "a-older"]);
+        active_poller.apply_update(MessagePollUpdate {
+            messages: Vec::new(),
+            seen_ids: vec!["a-latest".to_owned()],
+            pending_fresh: Vec::new(),
+            pending_seen_ids: Vec::new(),
+            backlog_next: None,
+            initialized: true,
+            commit_seen: true,
+        });
+        let inactive_poller = MessagePoller::new(dummy_client(), "room-b")
+            .with_config(old_room_polling)
+            .with_seen_message_ids(["b-newer", "b-older"]);
+        let mut poller = MultiRoomMessagePoller::new(dummy_client());
+        poller.rooms.insert(
+            "room-a".to_owned(),
+            RoomPollerEntry {
+                room: room("room-a"),
+                poller: active_poller,
+            },
+        );
+        poller.inactive_rooms.insert(
+            "room-b".to_owned(),
+            RoomPollerEntry {
+                room: room("room-b"),
+                poller: inactive_poller,
+            },
+        );
+
+        let poller = poller.with_config(MultiRoomPollingConfig {
+            room_polling: new_room_polling,
+            ..MultiRoomPollingConfig::default()
+        });
+
+        let active = &poller.rooms["room-a"].poller;
+        assert_eq!(active.config.page_size, 7);
+        assert_eq!(active.config.max_seen_ids, 1);
+        assert!(active.seen.contains("a-latest"));
+        assert!(!active.seen.contains("a-newer"));
+        let inactive = &poller.inactive_rooms["room-b"].poller;
+        assert_eq!(inactive.config.page_size, 7);
+        assert_eq!(inactive.config.max_seen_ids, 1);
+        assert!(inactive.seen.contains("b-newer"));
+        assert!(!inactive.seen.contains("b-older"));
     }
 
     #[test]
@@ -2316,6 +2434,13 @@ mod tests {
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].starts_with("GET /v1/messages?page=2"));
         assert!(requests[4].contains("roomId=room-b"));
+    }
+
+    fn room(id: &str) -> Room {
+        Room {
+            id: Some(id.to_owned()),
+            ..Room::default()
+        }
     }
 
     fn message(id: &str) -> Message {

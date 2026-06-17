@@ -9,6 +9,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors returned by the Webex client and OAuth helpers.
 #[derive(Debug, ThisError)]
+#[non_exhaustive]
 pub enum Error {
     #[error("http client error: {0}")]
     Http(#[from] reqwest::Error),

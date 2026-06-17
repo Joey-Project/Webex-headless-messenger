@@ -285,7 +285,8 @@ and skips existing messages on the first poll by default.
 For generic-account services that must recover gaps across every joined space,
 use `discover_joined_rooms` or `MultiRoomMessagePoller`. Persist and restore the
 whole `RoomCheckpoint`, including `initialize_empty`; `seen_message_ids` are
-newest-first when present. Newly discovered rooms without checkpoints only
+newest-first when present. `RoomCheckpoint` implements serde serialization for
+direct JSON/JSONL persistence. Newly discovered rooms without checkpoints only
 establish a baseline on their first poll. Direct `poll_once` calls, `spawn`,
 and `spawn_batches` return per-room events plus `RoomCheckpoint` updates for
 durable state. Per-room failures without active pending backlog are emitted as
