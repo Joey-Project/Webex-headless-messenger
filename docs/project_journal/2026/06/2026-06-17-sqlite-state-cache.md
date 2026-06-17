@@ -16,6 +16,7 @@ superseded_by:
 - Added the optional `sqlite-state-cache` feature with `SqliteStateCache` as a rebuildable SQLite index over the JSONL state source of truth.
 - Indexed processed message IDs and room checkpoints for faster lookup without changing JSONL write correctness semantics.
 - Added rebuild APIs from `JsonlStateStore`, `StateSnapshot`, or a JSONL path, plus feature-gated tests for index rebuild and stale-index replacement.
+- Hardened SQLite cache paths against URI-style opens, symlink targets, unsafe parent directories, unsafe current directories for bare relative filenames, and untrusted Unix file owners.
 
 ## Current State
 - JSONL remains the correctness source of truth; SQLite is only an acceleration layer and can be rebuilt at any time.
