@@ -314,8 +314,14 @@ async fn main() -> webex_headless_messenger::Result<()> {
         .spawn();
 
     while let Some(event) = events.recv().await {
-        let room_message = event?;
-        println!("{} {:?}", room_message.room_id, room_message.message.text);
+        match event {
+            Ok(room_message) => {
+                println!("{} {:?}", room_message.room_id, room_message.message.text);
+            }
+            Err(error) => {
+                eprintln!("recoverable multi-room poll error: {error}");
+            }
+        }
     }
 
     Ok(())
