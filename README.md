@@ -291,7 +291,9 @@ batch with per-room events plus `RoomCheckpoint` updates for durable state, so
 one failing room does not block catch-up for other rooms. `MultiRoomMessagePoller`
 bounds discovery and room polling with `room_discovery_timeout`,
 `room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by
-default.
+default. Inactive rooms with pending backlog are retained above the inactive
+limit until they reappear and drain, but they do not block delivery for
+currently visible rooms.
 
 ```rust
 use std::time::Duration;

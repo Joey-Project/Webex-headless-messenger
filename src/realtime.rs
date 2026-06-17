@@ -85,7 +85,9 @@ pub struct MultiRoomPollingConfig {
     /// Maximum rooms polled concurrently. Values below 1 are treated as 1.
     pub max_concurrent_room_polls: usize,
     /// Maximum inactive room poller states retained for rooms that disappear from discovery.
-    /// Values below 1 are treated as 1.
+    /// Values below 1 are treated as 1. Inactive rooms with pending backlog are
+    /// retained above this limit until they reappear and drain, but they do not
+    /// block delivery for currently visible rooms.
     pub max_inactive_rooms: usize,
 }
 
@@ -739,9 +741,8 @@ impl MultiRoomMessagePoller {
             }
         }
 
-        let inactive_backlog_pending = self.has_pending_inactive_backlog();
         let room_batch = self.poll_rooms_concurrently().await;
-        let has_pending_backlog = inactive_backlog_pending || room_batch.has_pending_backlog;
+        let has_pending_backlog = room_batch.has_pending_backlog;
         let mut messages = room_batch.messages;
         errors.extend(room_batch.errors);
         let mut events = if has_pending_backlog {
@@ -862,12 +863,6 @@ impl MultiRoomMessagePoller {
         }
     }
 
-    fn has_pending_inactive_backlog(&self) -> bool {
-        self.inactive_rooms
-            .values()
-            .any(|entry| entry.poller.has_pending_backlog())
-    }
-
     fn room_refresh_due(&self) -> bool {
         self.last_room_discovery
             .map(|last| last.elapsed() >= self.config.room_refresh_interval)
@@ -972,13 +967,23 @@ fn prune_inactive_rooms(
     let limit = max_inactive_rooms.max(1);
     inactive_room_order.retain(|room_id| inactive_rooms.contains_key(room_id));
     while inactive_rooms.len() > limit {
-        let Some(room_id) = inactive_room_order.pop_front() else {
-            let Some(room_id) = inactive_rooms.keys().next().cloned() else {
-                break;
-            };
-            inactive_rooms.remove(&room_id);
-            continue;
+        let removable_room_id = inactive_room_order
+            .iter()
+            .find(|room_id| {
+                inactive_rooms
+                    .get(*room_id)
+                    .is_some_and(|entry| !entry.poller.has_pending_backlog())
+            })
+            .cloned()
+            .or_else(|| {
+                inactive_rooms.iter().find_map(|(room_id, entry)| {
+                    (!entry.poller.has_pending_backlog()).then_some(room_id.clone())
+                })
+            });
+        let Some(room_id) = removable_room_id else {
+            break;
         };
+        inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
         inactive_rooms.remove(&room_id);
     }
 }
@@ -1029,7 +1034,7 @@ fn compare_indexed_room_messages(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashSet, VecDeque},
+        collections::{BTreeMap, HashSet, VecDeque},
         time::{Duration, Instant},
     };
 
@@ -1042,13 +1047,17 @@ mod tests {
     };
     use url::Url;
 
-    use crate::{Error, WebexClient, types::Message};
+    use crate::{
+        Error, WebexClient,
+        types::{Message, Room},
+    };
 
     use super::{
         MessagePoller, MultiRoomMessagePoller, MultiRoomPollingConfig, PollingConfig,
-        RoomCheckpoint, RoomDiscoveryConfig, SeenMessageIds, collect_page_messages,
-        discover_joined_rooms, effective_poll_interval, ensure_pending_within_limit,
-        poll_tick_or_receiver_open, preserve_pending_on_page_error,
+        RoomCheckpoint, RoomDiscoveryConfig, RoomPollerEntry, SeenMessageIds,
+        collect_page_messages, discover_joined_rooms, effective_poll_interval,
+        ensure_pending_within_limit, poll_tick_or_receiver_open, preserve_pending_on_page_error,
+        prune_inactive_rooms,
     };
 
     #[test]
@@ -1517,7 +1526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_room_poller_blocks_on_pending_inactive_room() {
+    async fn multi_room_poller_does_not_block_on_pending_inactive_room() {
         let (base_url, requests) = spawn_sequence_server_with_address(|address| {
             let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
             vec![
@@ -1537,6 +1546,9 @@ mod tests {
                 ),
                 MockResponse::json(
                     r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
             ]
         })
@@ -1563,21 +1575,29 @@ mod tests {
         let third_events = poller.poll_once().await.unwrap().events;
 
         assert!(first_events.is_empty());
-        assert!(second_events.is_empty());
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["b-later"]
+        );
         assert_eq!(
             third_events
                 .iter()
                 .filter_map(|event| event.as_ref().ok())
                 .map(|message| message.message.id.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["a-older", "a-newer", "b-later"]
+            ["a-older", "a-newer"]
         );
 
         let requests = requests.await.unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert!(requests[3].starts_with("GET /v1/rooms?"));
         assert!(requests[4].starts_with("GET /v1/rooms?"));
         assert!(requests[5].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[6].contains("roomId=room-b"));
     }
 
     #[tokio::test]
@@ -1608,6 +1628,41 @@ mod tests {
             VecDeque::from(["room-b".to_owned()])
         );
         assert_eq!(requests.await.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn prune_inactive_rooms_retains_pending_backlog_states() {
+        let mut pending_poller = MessagePoller::new(dummy_client(), "room-a");
+        pending_poller.pending_fresh = vec![message("a-pending")];
+        let idle_poller = MessagePoller::new(dummy_client(), "room-b").with_empty_seen_boundary();
+        let mut inactive_rooms = BTreeMap::new();
+        inactive_rooms.insert(
+            "room-a".to_owned(),
+            RoomPollerEntry {
+                room: Room {
+                    id: Some("room-a".to_owned()),
+                    ..Room::default()
+                },
+                poller: pending_poller,
+            },
+        );
+        inactive_rooms.insert(
+            "room-b".to_owned(),
+            RoomPollerEntry {
+                room: Room {
+                    id: Some("room-b".to_owned()),
+                    ..Room::default()
+                },
+                poller: idle_poller,
+            },
+        );
+        let mut inactive_room_order = VecDeque::from(["room-a".to_owned(), "room-b".to_owned()]);
+
+        prune_inactive_rooms(&mut inactive_rooms, &mut inactive_room_order, 1);
+
+        assert!(inactive_rooms.contains_key("room-a"));
+        assert!(!inactive_rooms.contains_key("room-b"));
+        assert_eq!(inactive_room_order, VecDeque::from(["room-a".to_owned()]));
     }
 
     #[tokio::test]
