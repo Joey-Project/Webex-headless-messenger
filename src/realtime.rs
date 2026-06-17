@@ -341,10 +341,12 @@ impl MessagePoller {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.seen.remember_newest_first(
-            ids.into_iter().map(Into::into).collect::<Vec<_>>(),
-            self.config.max_seen_ids,
-        );
+        let ids = ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        if ids.is_empty() {
+            return self;
+        }
+        self.seen
+            .remember_newest_first(ids, self.config.max_seen_ids);
         self.initialized = true;
         self
     }
@@ -646,10 +648,17 @@ impl MultiRoomMessagePoller {
                 Err(error) => errors.push(Err(error)),
             }
         }
-        messages.sort_by(compare_room_messages);
-        let mut events = messages.into_iter().map(Ok).collect::<Vec<_>>();
+        let mut events = if room_batch.has_pending_backlog {
+            Vec::new()
+        } else {
+            messages.sort_by(compare_room_messages);
+            messages.into_iter().map(Ok).collect::<Vec<_>>()
+        };
         events.extend(errors);
         for (room_id, update) in room_batch.completed_updates {
+            if room_batch.has_pending_backlog && update.commit_seen {
+                continue;
+            }
             if let Some(current) = self.rooms.get_mut(&room_id) {
                 current.poller.apply_update(update);
             }
@@ -664,6 +673,7 @@ impl MultiRoomMessagePoller {
         let mut active_polls = FuturesUnordered::new();
         let mut events = Vec::new();
         let mut completed_updates = Vec::new();
+        let mut has_pending_backlog = false;
 
         for _ in 0..max_concurrent {
             let Some((room_id, entry)) = remaining_rooms.next() else {
@@ -676,6 +686,9 @@ impl MultiRoomMessagePoller {
             match poll_result {
                 RoomPollResult::Completed(result) => match *result {
                     Ok(mut update) => {
+                        if !update.commit_seen {
+                            has_pending_backlog = true;
+                        }
                         let room_messages = std::mem::take(&mut update.messages);
                         completed_updates.push((room_id.clone(), update));
                         for message in room_messages {
@@ -688,6 +701,9 @@ impl MultiRoomMessagePoller {
                     }
                     Err(error) => {
                         if let Some(update) = error.update {
+                            if !update.commit_seen {
+                                has_pending_backlog = true;
+                            }
                             completed_updates.push((room_id.clone(), update));
                         }
                         events.push(Err(Error::RoomPoll {
@@ -713,6 +729,7 @@ impl MultiRoomMessagePoller {
         RoomPollBatch {
             events,
             completed_updates,
+            has_pending_backlog,
         }
     }
 
@@ -787,6 +804,7 @@ async fn discover_joined_rooms_with_timeout(
 struct RoomPollBatch {
     events: Vec<Result<RoomMessage>>,
     completed_updates: Vec<(String, MessagePollUpdate)>,
+    has_pending_backlog: bool,
 }
 
 enum RoomPollResult {
@@ -1093,6 +1111,15 @@ mod tests {
         assert!(!poller.seen.contains("older"));
     }
 
+    #[test]
+    fn empty_seeded_message_poller_is_not_initialized() {
+        let poller = MessagePoller::new(dummy_client(), "room-1")
+            .with_seen_message_ids(std::iter::empty::<&str>());
+
+        assert!(!poller.initialized);
+        assert!(poller.seen.ids.is_empty());
+    }
+
     #[tokio::test]
     async fn discovers_joined_rooms_with_query_config() {
         let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
@@ -1373,6 +1400,7 @@ mod tests {
                     page_size: 10,
                     ..PollingConfig::default()
                 },
+                max_concurrent_room_polls: 1,
                 ..MultiRoomPollingConfig::default()
             })
             .with_room_checkpoints([
@@ -1408,6 +1436,70 @@ mod tests {
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].starts_with("GET /v1/messages?"));
         assert!(requests[2].contains("roomId=room-b"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_holds_messages_until_room_backlogs_drain() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let first_events = poller.poll_once().await.unwrap();
+        let second_events = poller.poll_once().await.unwrap();
+        let messages = second_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(first_events.is_empty());
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer", "b-later"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(requests[3].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[4].contains("roomId=room-b"));
     }
 
     fn message(id: &str) -> Message {
@@ -2016,6 +2108,33 @@ mod tests {
             server,
             request_started_rx,
             client_closed_rx,
+        )
+    }
+
+    async fn spawn_sequence_server_with_address<F>(
+        make_responses: F,
+    ) -> (Url, JoinHandle<Vec<String>>)
+    where
+        F: FnOnce(std::net::SocketAddr) -> Vec<MockResponse>,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = make_responses(address);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = VecDeque::from(responses);
+            while let Some(response) = responses.pop_front() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                write_mock_response(&mut stream, response).await;
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
         )
     }
 
