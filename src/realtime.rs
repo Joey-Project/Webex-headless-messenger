@@ -461,13 +461,14 @@ impl MultiRoomMessagePoller {
     }
 
     pub async fn refresh_rooms(&mut self) -> Result<Vec<Room>> {
-        self.last_room_discovery = Some(Instant::now());
         let discovered = discover_joined_rooms_with_timeout(
             &self.client,
             &self.config.discovery,
             self.config.room_discovery_timeout,
         )
-        .await?;
+        .await;
+        self.last_room_discovery = Some(Instant::now());
+        let discovered = discovered?;
         let mut next_rooms = BTreeMap::new();
         for room in discovered.iter().cloned() {
             let Some(room_id) = room.id.clone() else {
@@ -1297,6 +1298,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_room_poller_cancelled_refresh_does_not_advance_retry_interval() {
+        let (base_url, _requests) = spawn_tolerant_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_millis(50),
+                r#"{"items":[{"id":"room-a","title":"Room A"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: None,
+                room_refresh_interval: Duration::from_secs(60),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        let previous_discovery = Instant::now() - Duration::from_secs(120);
+        poller.last_room_discovery = Some(previous_discovery);
+        tokio::time::timeout(Duration::from_millis(1), poller.poll_once())
+            .await
+            .unwrap_err();
+
+        assert_eq!(poller.last_room_discovery, Some(previous_discovery));
+        assert!(poller.room_refresh_due());
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_slow_refresh_timeout_starts_retry_interval_after_failure() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(Duration::from_millis(50), r#"{"items":[]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: Some(Duration::from_millis(1)),
+                room_refresh_interval: Duration::from_millis(10),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        poller.last_room_discovery = Some(Instant::now() - Duration::from_secs(1));
+
+        let first_events = poller.poll_once().await.unwrap();
+        let second_events = poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert!(second_events.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test]
     async fn multi_room_poller_refresh_failure_is_throttled_by_refresh_interval() {
         let (base_url, requests) = spawn_sequence_server(vec![
             MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
@@ -1455,15 +1540,36 @@ mod tests {
     }
 
     async fn spawn_sequence_server(responses: Vec<MockResponse>) -> (Url, JoinHandle<Vec<String>>) {
+        spawn_sequence_server_with_options(responses, false).await
+    }
+
+    async fn spawn_tolerant_sequence_server(
+        responses: Vec<MockResponse>,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        spawn_sequence_server_with_options(responses, true).await
+    }
+
+    async fn spawn_sequence_server_with_options(
+        responses: Vec<MockResponse>,
+        allow_abandoned_connections: bool,
+    ) -> (Url, JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             let mut responses = VecDeque::from(responses);
             let mut response_tasks = Vec::new();
-            while let Some(response) = responses.pop_front() {
+            while !responses.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await;
+                let request = if allow_abandoned_connections {
+                    let Some(request) = read_http_request_opt(&mut stream, false).await else {
+                        continue;
+                    };
+                    request
+                } else {
+                    read_http_request(&mut stream).await
+                };
+                let response = responses.pop_front().unwrap();
                 requests.push(String::from_utf8_lossy(&request).into_owned());
                 response_tasks.push(tokio::spawn(async move {
                     write_mock_response(&mut stream, response).await;
@@ -1490,10 +1596,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             let mut response_tasks = Vec::new();
-            for _ in 0..expected_requests {
+            while requests.len() < expected_requests {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let request =
-                    String::from_utf8_lossy(&read_http_request(&mut stream).await).into_owned();
+                let Some(request) = read_http_request_opt(&mut stream, false).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request).into_owned();
                 let response = routes
                     .iter()
                     .find(|(needle, _)| request.contains(needle))
@@ -1540,14 +1648,28 @@ mod tests {
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        read_http_request_opt(stream, true)
+            .await
+            .expect("client closed before request completed")
+    }
+
+    async fn read_http_request_opt(
+        stream: &mut tokio::net::TcpStream,
+        assert_complete: bool,
+    ) -> Option<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 1024];
         loop {
             let read = stream.read(&mut buffer).await.unwrap();
-            assert_ne!(read, 0, "client closed before request completed");
+            if read == 0 {
+                if assert_complete {
+                    panic!("client closed before request completed");
+                }
+                return None;
+            }
             bytes.extend_from_slice(&buffer[..read]);
             if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                return bytes;
+                return Some(bytes);
             }
         }
     }
