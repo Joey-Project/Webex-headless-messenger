@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::mpsc, time};
 use url::Url;
@@ -419,6 +420,13 @@ impl MessagePoller {
     async fn poll_once_transaction(
         &self,
     ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
+        self.poll_once_transaction_before(None).await
+    }
+
+    async fn poll_once_transaction_before(
+        &self,
+        before: Option<DateTime<Utc>>,
+    ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
         if self.backlog_next.is_none() && !self.pending_fresh.is_empty() {
             let mut fresh = self.pending_fresh.clone();
             fresh.reverse();
@@ -444,6 +452,7 @@ impl MessagePoller {
         } else {
             let mut params = ListMessages::room(self.room_id.clone());
             params.max = Some(self.config.page_size);
+            params.before = before;
             self.client
                 .list_messages(&params)
                 .await
@@ -781,6 +790,7 @@ impl MultiRoomMessagePoller {
 
     async fn poll_rooms_concurrently(&self) -> RoomPollBatch {
         let timeout = self.config.room_poll_timeout;
+        let batch_cutoff = Utc::now();
         let max_concurrent = self.config.max_concurrent_room_polls.max(1);
         let mut remaining_rooms = self.rooms.iter();
         let mut active_polls = FuturesUnordered::new();
@@ -793,7 +803,7 @@ impl MultiRoomMessagePoller {
             let Some((room_id, entry)) = remaining_rooms.next() else {
                 break;
             };
-            active_polls.push(poll_room_entry(room_id, entry, timeout));
+            active_polls.push(poll_room_entry(room_id, entry, timeout, Some(batch_cutoff)));
         }
 
         while let Some((room_id, room, had_pending_backlog, poll_result)) =
@@ -850,7 +860,7 @@ impl MultiRoomMessagePoller {
             }
 
             if let Some((room_id, entry)) = remaining_rooms.next() {
-                active_polls.push(poll_room_entry(room_id, entry, timeout));
+                active_polls.push(poll_room_entry(room_id, entry, timeout, Some(batch_cutoff)));
             }
         }
 
@@ -1043,9 +1053,10 @@ async fn poll_room_entry(
     room_id: &str,
     entry: &RoomPollerEntry,
     timeout: Option<Duration>,
+    before: Option<DateTime<Utc>>,
 ) -> (String, Room, bool, RoomPollResult) {
     let had_pending_backlog = entry.poller.has_pending_backlog();
-    let result = poll_room_once(&entry.poller, timeout).await;
+    let result = poll_room_once(&entry.poller, timeout, before).await;
     (
         room_id.to_owned(),
         entry.room.clone(),
@@ -1054,13 +1065,19 @@ async fn poll_room_entry(
     )
 }
 
-async fn poll_room_once(poller: &MessagePoller, timeout: Option<Duration>) -> RoomPollResult {
+async fn poll_room_once(
+    poller: &MessagePoller,
+    timeout: Option<Duration>,
+    before: Option<DateTime<Utc>>,
+) -> RoomPollResult {
     let Some(timeout) = timeout else {
-        return RoomPollResult::Completed(Box::new(poller.poll_once_transaction().await));
+        return RoomPollResult::Completed(Box::new(
+            poller.poll_once_transaction_before(before).await,
+        ));
     };
     match time::timeout(
         effective_poll_interval(timeout),
-        poller.poll_once_transaction(),
+        poller.poll_once_transaction_before(before),
     )
     .await
     {
@@ -1890,6 +1907,62 @@ mod tests {
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].starts_with("GET /v1/messages?"));
         assert!(requests[2].contains("roomId=room-b"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_uses_shared_cutoff_for_room_batch() {
+        let (base_url, requests) = spawn_route_server(
+            vec![
+                (
+                    "GET /v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-b","title":"Room B"},{"id":"room-a","title":"Room A"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:02Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:01Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let events = poller.poll_once().await.unwrap().events;
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap().message.id.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, ["b-new", "a-new"]);
+
+        let requests = requests.await.unwrap();
+        let message_requests = requests
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/messages?"))
+            .collect::<Vec<_>>();
+        assert_eq!(message_requests.len(), 2);
+        let first_before = request_query_value(message_requests[0], "before").unwrap();
+        let second_before = request_query_value(message_requests[1], "before").unwrap();
+        assert_eq!(first_before, second_before);
     }
 
     #[tokio::test]
@@ -2812,6 +2885,15 @@ mod tests {
             Url::parse(&format!("http://{address}/v1/")).unwrap(),
             server,
         )
+    }
+
+    fn request_query_value<'a>(request: &'a str, key: &str) -> Option<&'a str> {
+        let path = request.split_whitespace().nth(1)?;
+        let (_, query) = path.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == key).then_some(value)
+        })
     }
 
     async fn spawn_pending_request_server(
