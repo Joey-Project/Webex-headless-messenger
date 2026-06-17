@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::mpsc, time};
+use tokio::{sync::mpsc, task::JoinSet, time};
 use url::Url;
 
 use crate::{
@@ -77,8 +77,12 @@ pub struct MultiRoomPollingConfig {
     pub discovery: RoomDiscoveryConfig,
     pub room_polling: PollingConfig,
     pub room_refresh_interval: Duration,
+    /// Optional timeout for joined-room discovery and refresh. Values below 1 ms are clamped.
+    pub room_discovery_timeout: Option<Duration>,
     /// Optional timeout for each room's polling pass. Values below 1 ms are clamped.
     pub room_poll_timeout: Option<Duration>,
+    /// Maximum rooms polled concurrently. Values below 1 are treated as 1.
+    pub max_concurrent_room_polls: usize,
 }
 
 impl Default for MultiRoomPollingConfig {
@@ -87,7 +91,9 @@ impl Default for MultiRoomPollingConfig {
             discovery: RoomDiscoveryConfig::default(),
             room_polling: PollingConfig::default(),
             room_refresh_interval: Duration::from_secs(300),
+            room_discovery_timeout: Some(Duration::from_secs(60)),
             room_poll_timeout: Some(Duration::from_secs(60)),
+            max_concurrent_room_polls: 16,
         }
     }
 }
@@ -456,7 +462,12 @@ impl MultiRoomMessagePoller {
 
     pub async fn refresh_rooms(&mut self) -> Result<Vec<Room>> {
         self.last_room_discovery = Some(Instant::now());
-        let discovered = discover_joined_rooms(&self.client, &self.config.discovery).await?;
+        let discovered = discover_joined_rooms_with_timeout(
+            &self.client,
+            &self.config.discovery,
+            self.config.room_discovery_timeout,
+        )
+        .await?;
         let mut next_rooms = BTreeMap::new();
         for room in discovered.iter().cloned() {
             let Some(room_id) = room.id.clone() else {
@@ -499,28 +510,68 @@ impl MultiRoomMessagePoller {
             }
         }
 
+        let room_events = self.poll_rooms_concurrently().await;
         let mut messages = Vec::new();
-        for (room_id, entry) in self.rooms.iter_mut() {
-            match poll_room_once(&mut entry.poller, self.config.room_poll_timeout).await {
-                Ok(room_messages) => {
-                    for message in room_messages {
-                        messages.push(RoomMessage {
-                            room_id: room_id.clone(),
-                            room: entry.room.clone(),
-                            message,
-                        });
-                    }
-                }
-                Err(source) => errors.push(Err(Error::RoomPoll {
-                    room_id: room_id.clone(),
-                    source: Box::new(source),
-                })),
+        for event in room_events {
+            match event {
+                Ok(message) => messages.push(message),
+                Err(error) => errors.push(Err(error)),
             }
         }
         messages.sort_by(compare_room_messages);
         let mut events = messages.into_iter().map(Ok).collect::<Vec<_>>();
         events.extend(errors);
         Ok(events)
+    }
+
+    async fn poll_rooms_concurrently(&mut self) -> Vec<Result<RoomMessage>> {
+        let timeout = self.config.room_poll_timeout;
+        let max_concurrent = self.config.max_concurrent_room_polls.max(1);
+        let mut remaining_rooms = std::mem::take(&mut self.rooms).into_iter();
+        let mut join_set = JoinSet::new();
+        let mut restored_rooms = BTreeMap::new();
+        let mut events = Vec::new();
+
+        for _ in 0..max_concurrent {
+            let Some((room_id, entry)) = remaining_rooms.next() else {
+                break;
+            };
+            spawn_room_poll(&mut join_set, room_id, entry, timeout);
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((room_id, entry, poll_result)) => {
+                    let room = entry.room.clone();
+                    restored_rooms.insert(room_id.clone(), entry);
+                    match poll_result {
+                        Ok(room_messages) => {
+                            for message in room_messages {
+                                events.push(Ok(RoomMessage {
+                                    room_id: room_id.clone(),
+                                    room: room.clone(),
+                                    message,
+                                }));
+                            }
+                        }
+                        Err(source) => events.push(Err(Error::RoomPoll {
+                            room_id,
+                            source: Box::new(source),
+                        })),
+                    }
+                }
+                Err(error) => {
+                    events.push(Err(Error::Other(format!("room poll task failed: {error}"))))
+                }
+            }
+
+            if let Some((room_id, entry)) = remaining_rooms.next() {
+                spawn_room_poll(&mut join_set, room_id, entry, timeout);
+            }
+        }
+
+        self.rooms = restored_rooms;
+        events
     }
 
     fn room_refresh_due(&self) -> bool {
@@ -558,6 +609,40 @@ impl MultiRoomMessagePoller {
         });
         receiver
     }
+}
+
+async fn discover_joined_rooms_with_timeout(
+    client: &WebexClient,
+    config: &RoomDiscoveryConfig,
+    timeout: Option<Duration>,
+) -> Result<Vec<Room>> {
+    let Some(timeout) = timeout else {
+        return discover_joined_rooms(client, config).await;
+    };
+    match time::timeout(
+        effective_poll_interval(timeout),
+        discover_joined_rooms(client, config),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::Other(format!(
+            "joined-room discovery timed out after {:?}",
+            effective_poll_interval(timeout)
+        ))),
+    }
+}
+
+fn spawn_room_poll(
+    join_set: &mut JoinSet<(String, RoomPollerEntry, Result<Vec<ListMessage>>)>,
+    room_id: String,
+    mut entry: RoomPollerEntry,
+    timeout: Option<Duration>,
+) {
+    join_set.spawn(async move {
+        let result = poll_room_once(&mut entry.poller, timeout).await;
+        (room_id, entry, result)
+    });
 }
 
 async fn poll_room_once(
@@ -931,6 +1016,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_room_poller_polls_later_room_while_earlier_rooms_timeout() {
+        let (base_url, _requests) = spawn_route_server(
+            vec![
+                (
+                    "/v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"},{"id":"room-c","title":"Room C"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::delay_json(Duration::from_secs(60), r#"{"items":[]}"#),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::delay_json(Duration::from_secs(60), r#"{"items":[]}"#),
+                ),
+                (
+                    "roomId=room-c",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"c-new","roomId":"room-c","text":"C new","created":"2026-06-17T00:00:02Z"},{"id":"c-seen","roomId":"room-c","text":"C seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            4,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: Some(Duration::from_millis(10)),
+                max_concurrent_room_polls: 3,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+                RoomCheckpoint::new("room-c", ["c-seen"]),
+            ]);
+
+        let events = poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["c-new"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn multi_room_poller_reports_room_error_without_dropping_other_rooms() {
         let (base_url, requests) = spawn_sequence_server(vec![
             MockResponse::json(
@@ -983,6 +1128,48 @@ mod tests {
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].contains("roomId=room-c"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_times_out_hung_refresh_and_polls_existing_rooms() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_secs(60),
+                r#"{"items":[{"id":"room-a","title":"Room A"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: Some(Duration::from_millis(1)),
+                room_refresh_interval: Duration::ZERO,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        let events = poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1108,6 +1295,7 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
     struct MockResponse {
         status: &'static str,
         headers: Vec<(&'static str, String)>,
@@ -1148,25 +1336,17 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             let mut responses = VecDeque::from(responses);
+            let mut response_tasks = Vec::new();
             while let Some(response) = responses.pop_front() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut stream).await;
                 requests.push(String::from_utf8_lossy(&request).into_owned());
-                if let Some(delay) = response.delay {
-                    tokio::time::sleep(delay).await;
-                }
-                let mut headers = String::new();
-                for (name, value) in response.headers {
-                    headers.push_str(&format!("{name}: {value}\r\n"));
-                }
-                let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    headers,
-                    response.body.len(),
-                    response.body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                response_tasks.push(tokio::spawn(async move {
+                    write_mock_response(&mut stream, response).await;
+                }));
+            }
+            for task in response_tasks {
+                task.await.unwrap();
             }
             requests
         });
@@ -1175,6 +1355,64 @@ mod tests {
             Url::parse(&format!("http://{address}/v1/")).unwrap(),
             server,
         )
+    }
+
+    async fn spawn_route_server(
+        routes: Vec<(&'static str, MockResponse)>,
+        expected_requests: usize,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut response_tasks = Vec::new();
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request =
+                    String::from_utf8_lossy(&read_http_request(&mut stream).await).into_owned();
+                let response = routes
+                    .iter()
+                    .find(|(needle, _)| request.contains(needle))
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(|| {
+                        MockResponse::status_json(
+                            "404 Not Found",
+                            format!(r#"{{"message":"no route for {request:?}"}}"#),
+                        )
+                    });
+                requests.push(request);
+                response_tasks.push(tokio::spawn(async move {
+                    write_mock_response(&mut stream, response).await;
+                }));
+            }
+            for task in response_tasks {
+                task.await.unwrap();
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+        )
+    }
+
+    async fn write_mock_response(stream: &mut tokio::net::TcpStream, response: MockResponse) {
+        if let Some(delay) = response.delay {
+            tokio::time::sleep(delay).await;
+        }
+        let mut headers = String::new();
+        for (name, value) in response.headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.status,
+            headers,
+            response.body.len(),
+            response.body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
