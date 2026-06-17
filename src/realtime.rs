@@ -48,7 +48,7 @@ impl Default for PollingConfig {
 }
 
 /// Room discovery configuration for generic-account catch-up across joined spaces.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomDiscoveryConfig {
     /// Maximum rooms to request per Webex page.
     pub page_size: u16,
@@ -667,6 +667,7 @@ impl MultiRoomMessagePoller {
     }
 
     pub fn with_config(mut self, config: MultiRoomPollingConfig) -> Self {
+        let discovery_changed = self.config.discovery != config.discovery;
         let room_polling = config.room_polling.clone();
         self.config = config;
         for entry in self.rooms.values_mut() {
@@ -674,6 +675,10 @@ impl MultiRoomMessagePoller {
         }
         for entry in self.inactive_rooms.values_mut() {
             entry.poller.set_config(room_polling.clone());
+        }
+        if discovery_changed {
+            self.rooms_initialized = false;
+            self.last_room_discovery = None;
         }
         self
     }
@@ -1863,6 +1868,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_room_poller_refreshes_immediately_after_discovery_config_change() {
+        let (base_url, requests) = spawn_route_server(
+            vec![
+                (
+                    "teamId=team-1",
+                    MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+                ),
+                (
+                    "GET /v1/rooms?",
+                    MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"b-existing","roomId":"room-b","text":"B existing","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client);
+
+        poller.refresh_rooms().await.unwrap();
+        let mut poller = poller.with_config(MultiRoomPollingConfig {
+            discovery: RoomDiscoveryConfig {
+                team_id: Some("team-1".to_owned()),
+                ..RoomDiscoveryConfig::default()
+            },
+            ..MultiRoomPollingConfig::default()
+        });
+
+        let batch = poller.poll_once().await.unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(poller.room_ids(), ["room-b"]);
+        assert_eq!(batch.checkpoints[0].room_id, "room-b");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("teamId=team-1"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(!requests[2].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
     async fn multi_room_poller_applies_checkpoint_after_room_discovery() {
         let (base_url, requests) = spawn_sequence_server(vec![
             MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
@@ -2763,6 +2814,75 @@ mod tests {
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].contains("roomId=room-c"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_rebuild_replays_successes_from_discarded_error_batch() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::status_json(
+                "500 Internal Server Error",
+                r#"{"message":"room b unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:02Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let config = MultiRoomPollingConfig {
+            max_concurrent_room_polls: 1,
+            ..MultiRoomPollingConfig::default()
+        };
+        let checkpoints = [
+            RoomCheckpoint::new("room-a", ["a-seen"]),
+            RoomCheckpoint::new("room-b", ["b-seen"]),
+        ];
+        let mut first = MultiRoomMessagePoller::new(client_for(base_url.clone()))
+            .with_config(config.clone())
+            .with_room_checkpoints(checkpoints.clone());
+
+        let first_events = first.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+
+        let mut rebuilt = MultiRoomMessagePoller::new(client_for(base_url))
+            .with_config(config)
+            .with_room_checkpoints(checkpoints);
+        let retry_events = rebuilt.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            retry_events
+                .iter()
+                .map(|event| event.as_ref().unwrap().message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new", "b-new"]
+        );
+        assert_eq!(requests.await.unwrap().len(), 6);
     }
 
     #[tokio::test]
