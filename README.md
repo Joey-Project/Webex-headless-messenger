@@ -24,6 +24,8 @@ Implemented in the first slice:
 - RFC5988 `Link` header pagination.
 - Structured API errors with `trackingId` and `Retry-After` when available.
 - Polling-based message receiver for deployments without public HTTP ingress.
+- Joined-room discovery and multi-room REST catch-up primitives for generic
+  account recovery across every joined space.
 - Local file upload helper for `multipart/form-data` message creation.
 - JavaScript SDK realtime sidecar demo that forwards normalized message events
   to a local Rust loopback receiver.
@@ -33,6 +35,13 @@ Implemented in the first slice:
   polling, and a loopback sidecar receiver.
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
   feature.
+
+Compatibility note:
+
+- `0.2.0` is a pre-1.0 breaking release. It extends polling configuration,
+  marks the public `Error` enum as non-exhaustive, and adds structured
+  multi-room polling errors. Prefer `..Default::default()` for public config
+  struct literals and keep wildcard arms when matching `Error`.
 
 Not implemented yet:
 
@@ -279,6 +288,82 @@ async fn main() -> webex_headless_messenger::Result<()> {
 
 Polling is intentionally conservative. It de-duplicates by message ID in memory
 and skips existing messages on the first poll by default.
+
+For generic-account services that must recover gaps across every joined space,
+use `discover_joined_rooms` or `MultiRoomMessagePoller`. Persist and restore the
+whole `RoomCheckpoint`, including `initialize_empty`; `seen_message_ids` are
+newest-first when present. `RoomCheckpoint` implements serde serialization for
+direct JSON/JSONL persistence. Newly discovered rooms without checkpoints only
+establish a baseline on their first poll. Direct `poll_once` calls, `spawn`,
+and `spawn_batches` return per-room events plus `RoomCheckpoint` updates for
+durable state. Per-room failures without active pending backlog are emitted as
+recoverable errors so other rooms can continue, and successful room state may
+advance in memory for that batch. Do not drop successful events from a batch and
+continue polling the same `MultiRoomMessagePoller`; if strict global
+chronological recovery across retryable room errors is required, discard that
+poller instance and rebuild from the last durable checkpoints before retrying.
+When an active room still has pending backlog, successful messages are held
+until the backlog drains to preserve chronological catch-up order.
+`MultiRoomMessagePoller` bounds discovery
+and room polling with `room_discovery_timeout`, `room_poll_timeout`,
+`max_concurrent_room_polls`, and `max_inactive_rooms` by default. Inactive rooms
+with pending backlog are retained above the inactive limit until they reappear
+and drain, but they do not block delivery for currently visible rooms.
+
+```rust
+use std::time::Duration;
+
+use webex_headless_messenger::{
+    MultiRoomMessagePoller, MultiRoomPollingConfig, PollingConfig, RoomCheckpoint, WebexClient,
+};
+
+#[tokio::main]
+async fn main() -> webex_headless_messenger::Result<()> {
+    let client = WebexClient::from_access_token(std::env::var("WEBEX_ACCESS_TOKEN").unwrap())?;
+    let mut batches = MultiRoomMessagePoller::new(client)
+        .with_config(MultiRoomPollingConfig {
+            room_polling: PollingConfig {
+                interval: Duration::from_secs(10),
+                ..PollingConfig::default()
+            },
+            ..MultiRoomPollingConfig::default()
+        })
+        .with_room_checkpoints([RoomCheckpoint::new(
+            "room-id-from-store",
+            ["newest-seen-message-id"],
+        )])
+        .spawn();
+
+    while let Some(batch) = batches.recv().await {
+        let batch = batch?;
+        let errors = batch
+            .events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            for error in errors {
+                eprintln!("recoverable multi-room poll error: {error}");
+            }
+            // Strict recovery path: do not handle successful events or persist
+            // checkpoints from this partial batch. Drop this poller and rebuild
+            // from the last durable checkpoints before retrying.
+            break;
+        }
+
+        for event in &batch.events {
+            let room_message = event.as_ref().expect("errors handled above");
+            println!("{} {:?}", room_message.room_id, room_message.message.text);
+        }
+        for checkpoint in &batch.checkpoints {
+            // Persist the whole checkpoint only after handling the batch events above.
+            eprintln!("checkpoint {:?}", checkpoint);
+        }
+    }
+
+    Ok(())
+}
+```
 
 ## Realtime Sidecar
 

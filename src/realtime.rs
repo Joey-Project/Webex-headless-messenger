@@ -1,15 +1,19 @@
 use std::{
-    collections::{HashSet, VecDeque},
-    time::Duration,
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet, VecDeque},
+    time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time};
 use url::Url;
 
 use crate::{
     client::WebexClient,
     error::{Error, Result},
-    types::{ListMessage, ListMessages},
+    types::{ListMessage, ListMessages, ListRooms, Room},
 };
 
 /// Polling configuration for machines that cannot expose a public webhook URL.
@@ -43,6 +47,167 @@ impl Default for PollingConfig {
     }
 }
 
+/// Room discovery configuration for generic-account catch-up across joined spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomDiscoveryConfig {
+    /// Maximum rooms to request per Webex page.
+    pub page_size: u16,
+    /// Maximum joined rooms to keep in one poller. Values below 1 are treated as 1.
+    pub max_rooms: usize,
+    /// Optional Webex room type filter, such as `group` or `direct`.
+    pub room_type: Option<String>,
+    /// Optional Webex team filter.
+    pub team_id: Option<String>,
+    /// Optional Webex room sort key.
+    pub sort_by: Option<String>,
+}
+
+impl Default for RoomDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            page_size: 100,
+            max_rooms: 1_000,
+            room_type: None,
+            team_id: None,
+            sort_by: None,
+        }
+    }
+}
+
+/// Polling configuration for all joined-room catch-up.
+#[derive(Debug, Clone)]
+pub struct MultiRoomPollingConfig {
+    pub discovery: RoomDiscoveryConfig,
+    pub room_polling: PollingConfig,
+    pub room_refresh_interval: Duration,
+    /// Optional timeout for joined-room discovery and refresh. Values below 1 ms are clamped.
+    pub room_discovery_timeout: Option<Duration>,
+    /// Optional timeout for each room's polling pass. Values below 1 ms are clamped.
+    pub room_poll_timeout: Option<Duration>,
+    /// Maximum rooms polled concurrently. Values below 1 are treated as 1.
+    pub max_concurrent_room_polls: usize,
+    /// Maximum inactive room poller states retained for rooms that disappear from discovery.
+    /// Values below 1 are treated as 1. Inactive rooms with pending backlog are
+    /// retained above this limit until they reappear and drain, but they do not
+    /// block delivery for currently visible rooms.
+    pub max_inactive_rooms: usize,
+}
+
+impl Default for MultiRoomPollingConfig {
+    fn default() -> Self {
+        Self {
+            discovery: RoomDiscoveryConfig::default(),
+            room_polling: PollingConfig::default(),
+            room_refresh_interval: Duration::from_secs(300),
+            room_discovery_timeout: Some(Duration::from_secs(60)),
+            room_poll_timeout: Some(Duration::from_secs(60)),
+            max_concurrent_room_polls: 16,
+            max_inactive_rooms: 1_000,
+        }
+    }
+}
+
+/// A durable checkpoint seed for one room.
+///
+/// `seen_message_ids` should be ordered newest-first when the list is bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomCheckpoint {
+    pub room_id: String,
+    pub seen_message_ids: Vec<String>,
+    /// Initialize the room even when the seed list is empty.
+    #[serde(default)]
+    pub initialize_empty: bool,
+}
+
+impl RoomCheckpoint {
+    pub fn new<I, S>(room_id: impl Into<String>, seen_message_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            room_id: room_id.into(),
+            seen_message_ids: seen_message_ids.into_iter().map(Into::into).collect(),
+            initialize_empty: false,
+        }
+    }
+
+    /// Create an explicit empty-room checkpoint for rooms known to have no prior messages.
+    pub fn known_empty(room_id: impl Into<String>) -> Self {
+        Self {
+            room_id: room_id.into(),
+            seen_message_ids: Vec::new(),
+            initialize_empty: true,
+        }
+    }
+}
+
+/// A message emitted from a joined-room catch-up pass.
+#[derive(Debug, Clone)]
+pub struct RoomMessage {
+    pub room_id: String,
+    pub room: Room,
+    pub message: ListMessage,
+}
+
+/// Result of one joined-room catch-up pass.
+#[derive(Debug)]
+pub struct MultiRoomPoll {
+    pub events: Vec<Result<RoomMessage>>,
+    pub checkpoints: Vec<RoomCheckpoint>,
+}
+
+impl MultiRoomPoll {
+    pub fn into_events(self) -> Vec<Result<RoomMessage>> {
+        self.events
+    }
+}
+
+/// Discover rooms currently visible to the authorized account.
+pub async fn discover_joined_rooms(
+    client: &WebexClient,
+    config: &RoomDiscoveryConfig,
+) -> Result<Vec<Room>> {
+    let first = client
+        .list_rooms(&ListRooms {
+            team_id: config.team_id.clone(),
+            room_type: config.room_type.clone(),
+            sort_by: config.sort_by.clone(),
+            max: Some(config.page_size),
+            ..ListRooms::default()
+        })
+        .await?;
+    let limit = config.max_rooms.max(1);
+    let mut page = first;
+    let mut rooms = Vec::new();
+    let mut room_indexes = BTreeMap::new();
+    loop {
+        for room in page.items {
+            if let Some(room_id) = room.id.clone() {
+                if let Some(index) = room_indexes.get(&room_id).copied() {
+                    rooms[index] = room;
+                } else {
+                    room_indexes.insert(room_id, rooms.len());
+                    rooms.push(room);
+                }
+            } else {
+                rooms.push(room);
+            }
+        }
+        let next = page.next.take();
+        if rooms.len() > limit {
+            return Err(Error::Other(format!(
+                "joined-room discovery exceeded max_rooms={limit}; narrow discovery or raise the limit"
+            )));
+        }
+        let Some(next) = next else {
+            break;
+        };
+        page = client.next_page::<Room>(next).await?;
+    }
+    Ok(rooms)
+}
+
 #[derive(Clone, Default)]
 struct SeenMessageIds {
     ids: HashSet<String>,
@@ -66,12 +231,17 @@ impl SeenMessageIds {
                 self.order.push_front(id);
             }
 
-            while self.ids.len() > max_ids {
-                if let Some(stale) = self.order.pop_back() {
-                    self.ids.remove(&stale);
-                } else {
-                    break;
-                }
+            self.truncate(max_ids);
+        }
+    }
+
+    fn truncate(&mut self, max_ids: usize) {
+        let max_ids = max_ids.max(1);
+        while self.ids.len() > max_ids {
+            if let Some(stale) = self.order.pop_back() {
+                self.ids.remove(&stale);
+            } else {
+                break;
             }
         }
     }
@@ -120,6 +290,19 @@ fn effective_poll_interval(interval: Duration) -> Duration {
     interval.max(Duration::from_millis(1))
 }
 
+async fn poll_tick_or_receiver_open<T>(
+    sender: &mpsc::Sender<T>,
+    interval: &mut time::Interval,
+) -> bool {
+    if sender.is_closed() {
+        return false;
+    }
+    tokio::select! {
+        _ = sender.closed() => false,
+        _ = interval.tick() => true,
+    }
+}
+
 fn ensure_pending_within_limit(
     pending_messages: usize,
     pending_ids: usize,
@@ -146,6 +329,22 @@ pub struct MessagePoller {
     pending_fresh: Vec<ListMessage>,
     pending_seen_ids: Vec<String>,
     initialized: bool,
+    seed_seen_message_ids: Option<Vec<String>>,
+}
+
+struct MessagePollUpdate {
+    messages: Vec<ListMessage>,
+    seen_ids: Vec<String>,
+    pending_fresh: Vec<ListMessage>,
+    pending_seen_ids: Vec<String>,
+    backlog_next: Option<Url>,
+    initialized: bool,
+    commit_seen: bool,
+}
+
+struct MessagePollError {
+    error: Error,
+    update: Option<MessagePollUpdate>,
 }
 
 impl MessagePoller {
@@ -159,30 +358,139 @@ impl MessagePoller {
             pending_fresh: Vec::new(),
             pending_seen_ids: Vec::new(),
             initialized: false,
+            seed_seen_message_ids: None,
         }
     }
 
     pub fn with_config(mut self, config: PollingConfig) -> Self {
-        self.config = config;
+        self.set_config(config);
         self
     }
 
-    pub async fn poll_once(&mut self) -> Result<Vec<ListMessage>> {
-        let mut page = if let Some(next) = self.backlog_next.clone() {
-            match self.client.next_page(next.clone()).await {
-                Ok(page) => {
-                    self.backlog_next = None;
-                    page
-                }
-                Err(error) => {
-                    self.backlog_next = Some(next);
-                    return Err(error);
-                }
+    fn set_config(&mut self, config: PollingConfig) {
+        self.config = config;
+        if let Some(ids) = self.seed_seen_message_ids.clone() {
+            self.reseed_seen_message_ids(ids);
+        } else {
+            self.seen.truncate(self.config.max_seen_ids);
+        }
+    }
+
+    fn replace_checkpoint(&mut self, seen_ids: Vec<String>, initialize_empty: bool) {
+        self.seen = SeenMessageIds::default();
+        self.backlog_next = None;
+        self.pending_fresh.clear();
+        self.pending_seen_ids.clear();
+        self.initialized = false;
+        self.seed_seen_message_ids = None;
+        if seen_ids.is_empty() {
+            if initialize_empty {
+                self.initialized = true;
             }
+        } else {
+            self.seed_seen_message_ids = Some(seen_ids.clone());
+            self.reseed_seen_message_ids(seen_ids);
+            self.initialized = true;
+        }
+    }
+
+    /// Seed the in-memory de-duplication boundary from durable state.
+    ///
+    /// Seed IDs should be ordered newest-first when the list is bounded.
+    /// Seeded pollers are treated as initialized, so the next poll emits
+    /// messages newer than the supplied IDs instead of only establishing a
+    /// baseline.
+    pub fn with_seen_message_ids<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let ids = ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        if ids.is_empty() {
+            return self;
+        }
+        self.seed_seen_message_ids = Some(ids.clone());
+        self.reseed_seen_message_ids(ids);
+        self.initialized = true;
+        self
+    }
+
+    pub fn with_empty_seen_boundary(mut self) -> Self {
+        self.initialized = true;
+        self
+    }
+
+    fn reseed_seen_message_ids(&mut self, ids: Vec<String>) {
+        self.seen = SeenMessageIds::default();
+        self.seen
+            .remember_newest_first(ids, self.config.max_seen_ids);
+    }
+
+    fn has_pending_backlog(&self) -> bool {
+        self.backlog_next.is_some()
+            || !self.pending_fresh.is_empty()
+            || !self.pending_seen_ids.is_empty()
+    }
+
+    pub async fn poll_once(&mut self) -> Result<Vec<ListMessage>> {
+        match self.poll_once_transaction().await {
+            Ok(mut update) => {
+                let messages = std::mem::take(&mut update.messages);
+                self.apply_update(update);
+                Ok(messages)
+            }
+            Err(error) => {
+                if let Some(update) = error.update {
+                    self.apply_update(update);
+                }
+                Err(error.error)
+            }
+        }
+    }
+
+    async fn poll_once_transaction(
+        &self,
+    ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
+        self.poll_once_transaction_before(None).await
+    }
+
+    async fn poll_once_transaction_before(
+        &self,
+        before: Option<DateTime<Utc>>,
+    ) -> std::result::Result<MessagePollUpdate, MessagePollError> {
+        if self.backlog_next.is_none() && !self.pending_fresh.is_empty() {
+            let mut fresh = self.pending_fresh.clone();
+            fresh.reverse();
+            return Ok(MessagePollUpdate {
+                messages: fresh,
+                seen_ids: self.pending_seen_ids.clone(),
+                pending_fresh: Vec::new(),
+                pending_seen_ids: Vec::new(),
+                backlog_next: None,
+                initialized: true,
+                commit_seen: true,
+            });
+        }
+
+        let mut page = if let Some(next) = self.backlog_next.clone() {
+            self.client
+                .next_page(next.clone())
+                .await
+                .map_err(|error| MessagePollError {
+                    error,
+                    update: None,
+                })?
         } else {
             let mut params = ListMessages::room(self.room_id.clone());
             params.max = Some(self.config.page_size);
-            self.client.list_messages(&params).await?
+            params.before = before;
+            self.client
+                .list_messages(&params)
+                .await
+                .map_err(|error| MessagePollError {
+                    error,
+                    update: None,
+                })?
         };
         let max_pages = self.config.max_pages_per_poll.max(1);
 
@@ -203,50 +511,93 @@ impl MessagePoller {
                 fresh.len(),
                 new_ids.len(),
                 self.config.max_pending_messages,
-            )?;
+            )
+            .map_err(|error| MessagePollError {
+                error,
+                update: None,
+            })?;
 
             if saw_known_message && self.initialized {
-                self.backlog_next = None;
                 break;
             }
             let Some(next) = page.next.take() else {
-                self.backlog_next = None;
                 break;
             };
             if page_index + 1 >= max_pages {
                 if self.initialized || self.config.emit_existing_on_first_poll {
-                    self.pending_fresh = fresh;
-                    self.pending_seen_ids = new_ids;
-                    self.backlog_next = Some(next);
-                    self.initialized = true;
-                    return Ok(Vec::new());
+                    return Ok(MessagePollUpdate {
+                        messages: Vec::new(),
+                        seen_ids: Vec::new(),
+                        pending_fresh: fresh,
+                        pending_seen_ids: new_ids,
+                        backlog_next: Some(next),
+                        initialized: true,
+                        commit_seen: false,
+                    });
                 }
                 break;
             }
             page = match self.client.next_page(next.clone()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    if preserve_pending_on_page_error(
+                    let update = preserve_pending_on_page_error(
                         self.initialized,
                         self.config.emit_existing_on_first_poll,
-                    ) {
-                        self.pending_fresh = fresh;
-                        self.pending_seen_ids = new_ids;
-                        self.backlog_next = Some(next);
-                        self.initialized = true;
-                    }
-                    return Err(error);
+                    )
+                    .then_some(MessagePollUpdate {
+                        messages: Vec::new(),
+                        seen_ids: Vec::new(),
+                        pending_fresh: fresh,
+                        pending_seen_ids: new_ids,
+                        backlog_next: Some(next),
+                        initialized: true,
+                        commit_seen: false,
+                    });
+                    return Err(MessagePollError { error, update });
                 }
             };
         }
 
-        self.seen
-            .remember_newest_first(new_ids, self.config.max_seen_ids);
-        self.pending_fresh.clear();
-        self.pending_seen_ids.clear();
-        self.initialized = true;
         fresh.reverse();
-        Ok(fresh)
+        Ok(MessagePollUpdate {
+            messages: fresh,
+            seen_ids: new_ids,
+            pending_fresh: Vec::new(),
+            pending_seen_ids: Vec::new(),
+            backlog_next: None,
+            initialized: true,
+            commit_seen: true,
+        })
+    }
+
+    fn checkpoint_after_update(
+        &self,
+        room_id: &str,
+        update: &MessagePollUpdate,
+    ) -> Option<RoomCheckpoint> {
+        if !update.commit_seen {
+            return None;
+        }
+        let mut seen = self.seen.clone();
+        seen.remember_newest_first(update.seen_ids.clone(), self.config.max_seen_ids);
+        Some(checkpoint_from_seen(room_id, &seen))
+    }
+
+    fn current_checkpoint(&self, room_id: &str) -> Option<RoomCheckpoint> {
+        self.initialized
+            .then(|| checkpoint_from_seen(room_id, &self.seen))
+    }
+
+    fn apply_update(&mut self, update: MessagePollUpdate) {
+        self.seed_seen_message_ids = None;
+        if update.commit_seen {
+            self.seen
+                .remember_newest_first(update.seen_ids, self.config.max_seen_ids);
+        }
+        self.pending_fresh = update.pending_fresh;
+        self.pending_seen_ids = update.pending_seen_ids;
+        self.backlog_next = update.backlog_next;
+        self.initialized = update.initialized;
     }
 
     pub fn spawn(mut self) -> mpsc::Receiver<Result<ListMessage>> {
@@ -254,8 +605,17 @@ impl MessagePoller {
         tokio::spawn(async move {
             let mut interval = time::interval(effective_poll_interval(self.config.interval));
             loop {
-                interval.tick().await;
-                match self.poll_once().await {
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
+                let result = tokio::select! {
+                    _ = sender.closed() => return,
+                    result = self.poll_once() => result,
+                };
+                match result {
                     Ok(messages) => {
                         for message in messages {
                             if sender.send(Ok(message)).await.is_err() {
@@ -275,15 +635,556 @@ impl MessagePoller {
     }
 }
 
+struct RoomPollerEntry {
+    room: Room,
+    poller: MessagePoller,
+}
+
+/// Multi-room message poller for generic accounts joined to many spaces.
+pub struct MultiRoomMessagePoller {
+    client: WebexClient,
+    config: MultiRoomPollingConfig,
+    rooms: BTreeMap<String, RoomPollerEntry>,
+    inactive_rooms: BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: VecDeque<String>,
+    checkpoints: BTreeMap<String, (Vec<String>, bool)>,
+    rooms_initialized: bool,
+    last_room_discovery: Option<Instant>,
+}
+
+impl MultiRoomMessagePoller {
+    pub fn new(client: WebexClient) -> Self {
+        Self {
+            client,
+            config: MultiRoomPollingConfig::default(),
+            rooms: BTreeMap::new(),
+            inactive_rooms: BTreeMap::new(),
+            inactive_room_order: VecDeque::new(),
+            checkpoints: BTreeMap::new(),
+            rooms_initialized: false,
+            last_room_discovery: None,
+        }
+    }
+
+    pub fn with_config(mut self, config: MultiRoomPollingConfig) -> Self {
+        let discovery_changed = self.config.discovery != config.discovery;
+        let room_polling = config.room_polling.clone();
+        self.config = config;
+        for entry in self.rooms.values_mut() {
+            entry.poller.set_config(room_polling.clone());
+        }
+        for entry in self.inactive_rooms.values_mut() {
+            entry.poller.set_config(room_polling.clone());
+        }
+        if discovery_changed {
+            self.rooms_initialized = false;
+            self.last_room_discovery = None;
+        }
+        self
+    }
+
+    /// Seed durable checkpoints for rooms that have not yet emitted checkpoints.
+    ///
+    /// Matching active or inactive room pollers are reseeded immediately. Any
+    /// remaining checkpoints are retained for rooms discovered later.
+    pub fn with_room_checkpoints<I>(mut self, checkpoints: I) -> Self
+    where
+        I: IntoIterator<Item = RoomCheckpoint>,
+    {
+        let mut checkpoints = checkpoints
+            .into_iter()
+            .map(|checkpoint| {
+                (
+                    checkpoint.room_id,
+                    (checkpoint.seen_message_ids, checkpoint.initialize_empty),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (room_id, entry) in self.rooms.iter_mut() {
+            if let Some((seen_ids, initialize_empty)) = checkpoints.remove(room_id) {
+                entry.poller.replace_checkpoint(seen_ids, initialize_empty);
+            }
+        }
+        for (room_id, entry) in self.inactive_rooms.iter_mut() {
+            if let Some((seen_ids, initialize_empty)) = checkpoints.remove(room_id) {
+                entry.poller.replace_checkpoint(seen_ids, initialize_empty);
+            }
+        }
+        self.checkpoints = checkpoints;
+        self
+    }
+
+    pub fn room_ids(&self) -> Vec<String> {
+        self.rooms.keys().cloned().collect()
+    }
+
+    pub async fn refresh_rooms(&mut self) -> Result<Vec<Room>> {
+        self.refresh_rooms_with_discovery_timeout(self.config.room_discovery_timeout)
+            .await
+    }
+
+    async fn refresh_rooms_with_discovery_timeout(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<Room>> {
+        let discovered =
+            discover_joined_rooms_with_timeout(&self.client, &self.config.discovery, timeout).await;
+        self.last_room_discovery = Some(Instant::now());
+        let discovered = discovered?;
+        let mut next_rooms: BTreeMap<String, RoomPollerEntry> = BTreeMap::new();
+        let mut next_inactive_rooms = std::mem::take(&mut self.inactive_rooms);
+        let mut next_inactive_room_order = std::mem::take(&mut self.inactive_room_order);
+        for room in discovered.iter().cloned() {
+            let Some(room_id) = room.id.clone() else {
+                continue;
+            };
+            if let Some(existing) = next_rooms.get_mut(&room_id) {
+                existing.room = room;
+                continue;
+            }
+            if let Some(mut existing) = self.rooms.remove(&room_id) {
+                existing.room = room;
+                next_rooms.insert(room_id, existing);
+            } else if let Some(mut existing) = next_inactive_rooms.remove(&room_id) {
+                next_inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
+                existing.room = room;
+                next_rooms.insert(room_id, existing);
+            } else {
+                let mut poller = MessagePoller::new(self.client.clone(), room_id.clone())
+                    .with_config(self.config.room_polling.clone());
+                if let Some((seen_ids, initialize_empty)) = self.checkpoints.remove(&room_id) {
+                    poller = if seen_ids.is_empty() && initialize_empty {
+                        poller.with_empty_seen_boundary()
+                    } else {
+                        poller.with_seen_message_ids(seen_ids)
+                    };
+                }
+                next_rooms.insert(room_id, RoomPollerEntry { room, poller });
+            }
+        }
+        for (room_id, entry) in std::mem::take(&mut self.rooms) {
+            remember_inactive_room(
+                &mut next_inactive_rooms,
+                &mut next_inactive_room_order,
+                room_id,
+                entry,
+            );
+        }
+        prune_inactive_rooms(
+            &mut next_inactive_rooms,
+            &mut next_inactive_room_order,
+            &mut self.checkpoints,
+            self.config.max_inactive_rooms,
+        );
+        self.rooms = next_rooms;
+        self.inactive_rooms = next_inactive_rooms;
+        self.inactive_room_order = next_inactive_room_order;
+        self.rooms_initialized = true;
+        Ok(discovered)
+    }
+
+    /// Poll discovered rooms once.
+    ///
+    /// The outer error is reserved for initial room discovery failures. After
+    /// rooms are initialized, refresh and per-room polling failures are returned
+    /// as individual error events so successful rooms can still make progress.
+    pub async fn poll_once(&mut self) -> Result<MultiRoomPoll> {
+        let refreshed_this_poll = if !self.rooms_initialized {
+            self.refresh_rooms_with_discovery_timeout(self.config.room_discovery_timeout)
+                .await?;
+            true
+        } else {
+            false
+        };
+
+        let mut errors = Vec::new();
+        if !refreshed_this_poll && self.room_refresh_due() {
+            if let Err(error) = self
+                .refresh_rooms_with_discovery_timeout(self.config.room_discovery_timeout)
+                .await
+            {
+                errors.push(Err(error));
+            }
+        }
+
+        let room_batch = self.poll_rooms_concurrently().await;
+        let has_pending_backlog = room_batch.has_pending_backlog;
+        let mut messages = room_batch.messages;
+        errors.extend(room_batch.errors);
+        let mut events = if has_pending_backlog {
+            Vec::new()
+        } else {
+            messages.sort_by(compare_indexed_room_messages);
+            messages
+                .into_iter()
+                .map(|message| Ok(message.message))
+                .collect::<Vec<_>>()
+        };
+        events.extend(errors);
+
+        let mut checkpoints = Vec::new();
+        for (room_id, mut update) in room_batch.completed_updates {
+            if has_pending_backlog && update.commit_seen && !update.messages.is_empty() {
+                let mut pending_fresh = std::mem::take(&mut update.messages);
+                pending_fresh.reverse();
+                update.pending_fresh = pending_fresh;
+                update.pending_seen_ids = std::mem::take(&mut update.seen_ids);
+                update.commit_seen = false;
+            }
+            if let Some(current) = self.rooms.get_mut(&room_id) {
+                if let Some(checkpoint) = current.poller.checkpoint_after_update(&room_id, &update)
+                {
+                    checkpoints.push(checkpoint);
+                }
+                current.poller.apply_update(update);
+            }
+        }
+        checkpoints.sort_by(|left, right| left.room_id.cmp(&right.room_id));
+        Ok(MultiRoomPoll {
+            events,
+            checkpoints,
+        })
+    }
+
+    async fn poll_rooms_concurrently(&self) -> RoomPollBatch {
+        let timeout = self.config.room_poll_timeout;
+        let batch_cutoff = Utc::now();
+        let max_concurrent = self.config.max_concurrent_room_polls.max(1);
+        let mut remaining_rooms = self.rooms.iter();
+        let mut active_polls = FuturesUnordered::new();
+        let mut messages = Vec::new();
+        let mut errors = Vec::new();
+        let mut completed_updates = Vec::new();
+        let mut has_pending_backlog = false;
+
+        for _ in 0..max_concurrent {
+            let Some((room_id, entry)) = remaining_rooms.next() else {
+                break;
+            };
+            active_polls.push(poll_room_entry(room_id, entry, timeout, Some(batch_cutoff)));
+        }
+
+        while let Some((room_id, room, had_pending_backlog, poll_result)) =
+            active_polls.next().await
+        {
+            match poll_result {
+                RoomPollResult::Completed(result) => match *result {
+                    Ok(update) => {
+                        if !update.commit_seen {
+                            has_pending_backlog = true;
+                        }
+                        for (sequence, message) in update.messages.iter().cloned().enumerate() {
+                            messages.push(IndexedRoomMessage {
+                                sequence,
+                                message: RoomMessage {
+                                    room_id: room_id.clone(),
+                                    room: room.clone(),
+                                    message,
+                                },
+                            });
+                        }
+                        completed_updates.push((room_id.clone(), update));
+                    }
+                    Err(error) => {
+                        let mut preserved_update = false;
+                        if let Some(update) = error.update {
+                            preserved_update = true;
+                            if !update.commit_seen {
+                                has_pending_backlog = true;
+                            }
+                            completed_updates.push((room_id.clone(), update));
+                        }
+                        if had_pending_backlog && !preserved_update {
+                            has_pending_backlog = true;
+                        }
+                        errors.push(Err(Error::RoomPoll {
+                            room_id,
+                            source: Box::new(error.error),
+                        }));
+                    }
+                },
+                RoomPollResult::TimedOut(timeout) => {
+                    if had_pending_backlog {
+                        has_pending_backlog = true;
+                    }
+                    errors.push(Err(Error::RoomPoll {
+                        room_id,
+                        source: Box::new(Error::Other(format!(
+                            "room poll timed out after {:?}",
+                            effective_poll_interval(timeout)
+                        ))),
+                    }));
+                }
+            }
+
+            if let Some((room_id, entry)) = remaining_rooms.next() {
+                active_polls.push(poll_room_entry(room_id, entry, timeout, Some(batch_cutoff)));
+            }
+        }
+
+        RoomPollBatch {
+            messages,
+            errors,
+            completed_updates,
+            has_pending_backlog,
+        }
+    }
+
+    fn room_refresh_due(&self) -> bool {
+        self.last_room_discovery
+            .map(|last| last.elapsed() >= self.config.room_refresh_interval)
+            .unwrap_or(false)
+    }
+
+    /// Spawn a background multi-room poll loop that yields full poll batches.
+    ///
+    /// The receiver yields per-poll batches with both room events and
+    /// [`RoomCheckpoint`] updates for durable catch-up.
+    pub fn spawn(self) -> mpsc::Receiver<Result<MultiRoomPoll>> {
+        self.spawn_batches()
+    }
+
+    /// Spawn a background multi-room poll loop that yields full poll batches.
+    ///
+    /// This is an explicit alias for [`Self::spawn`].
+    pub fn spawn_batches(mut self) -> mpsc::Receiver<Result<MultiRoomPoll>> {
+        let (sender, receiver) = mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut interval =
+                time::interval(effective_poll_interval(self.config.room_polling.interval));
+            loop {
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
+                let result = tokio::select! {
+                    _ = sender.closed() => return,
+                    result = self.poll_once() => result,
+                };
+                if sender.send(result).await.is_err() {
+                    return;
+                }
+            }
+        });
+        receiver
+    }
+
+    /// Spawn a background multi-room poll loop that yields only room messages.
+    ///
+    /// The receiver yields room messages and recoverable refresh/per-room errors.
+    /// Use [`Self::spawn`] or direct [`Self::poll_once`] calls when checkpoint
+    /// persistence is required.
+    pub fn spawn_messages(mut self) -> mpsc::Receiver<Result<RoomMessage>> {
+        let (sender, receiver) = mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut interval =
+                time::interval(effective_poll_interval(self.config.room_polling.interval));
+            loop {
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
+                let result = tokio::select! {
+                    _ = sender.closed() => return,
+                    result = self.poll_once() => result,
+                };
+                match result {
+                    Ok(batch) => {
+                        for event in batch.events {
+                            if sender.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if sender.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        receiver
+    }
+}
+
+async fn discover_joined_rooms_with_timeout(
+    client: &WebexClient,
+    config: &RoomDiscoveryConfig,
+    timeout: Option<Duration>,
+) -> Result<Vec<Room>> {
+    let Some(timeout) = timeout else {
+        return discover_joined_rooms(client, config).await;
+    };
+    match time::timeout(
+        effective_poll_interval(timeout),
+        discover_joined_rooms(client, config),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::Other(format!(
+            "joined-room discovery timed out after {:?}",
+            effective_poll_interval(timeout)
+        ))),
+    }
+}
+
+struct IndexedRoomMessage {
+    sequence: usize,
+    message: RoomMessage,
+}
+
+struct RoomPollBatch {
+    messages: Vec<IndexedRoomMessage>,
+    errors: Vec<Result<RoomMessage>>,
+    completed_updates: Vec<(String, MessagePollUpdate)>,
+    has_pending_backlog: bool,
+}
+
+enum RoomPollResult {
+    Completed(Box<std::result::Result<MessagePollUpdate, MessagePollError>>),
+    TimedOut(Duration),
+}
+
+fn checkpoint_from_seen(room_id: &str, seen: &SeenMessageIds) -> RoomCheckpoint {
+    if seen.order.is_empty() {
+        RoomCheckpoint::known_empty(room_id.to_owned())
+    } else {
+        RoomCheckpoint::new(room_id.to_owned(), seen.order.iter().cloned())
+    }
+}
+
+fn remember_inactive_room(
+    inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: &mut VecDeque<String>,
+    room_id: String,
+    entry: RoomPollerEntry,
+) {
+    inactive_rooms.insert(room_id.clone(), entry);
+    inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
+    inactive_room_order.push_back(room_id);
+}
+
+fn prune_inactive_rooms(
+    inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
+    inactive_room_order: &mut VecDeque<String>,
+    checkpoints: &mut BTreeMap<String, (Vec<String>, bool)>,
+    max_inactive_rooms: usize,
+) {
+    let limit = max_inactive_rooms.max(1);
+    inactive_room_order.retain(|room_id| inactive_rooms.contains_key(room_id));
+    while inactive_rooms.len() > limit {
+        let removable_room_id = inactive_room_order
+            .iter()
+            .find(|room_id| {
+                inactive_rooms
+                    .get(*room_id)
+                    .is_some_and(|entry| !entry.poller.has_pending_backlog())
+            })
+            .cloned()
+            .or_else(|| {
+                inactive_rooms.iter().find_map(|(room_id, entry)| {
+                    (!entry.poller.has_pending_backlog()).then_some(room_id.clone())
+                })
+            });
+        let Some(room_id) = removable_room_id else {
+            break;
+        };
+        inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
+        if let Some(entry) = inactive_rooms.remove(&room_id) {
+            if let Some(checkpoint) = entry.poller.current_checkpoint(&room_id) {
+                checkpoints.insert(
+                    room_id,
+                    (checkpoint.seen_message_ids, checkpoint.initialize_empty),
+                );
+            }
+        }
+    }
+}
+
+async fn poll_room_entry(
+    room_id: &str,
+    entry: &RoomPollerEntry,
+    timeout: Option<Duration>,
+    before: Option<DateTime<Utc>>,
+) -> (String, Room, bool, RoomPollResult) {
+    let had_pending_backlog = entry.poller.has_pending_backlog();
+    let result = poll_room_once(&entry.poller, timeout, before).await;
+    (
+        room_id.to_owned(),
+        entry.room.clone(),
+        had_pending_backlog,
+        result,
+    )
+}
+
+async fn poll_room_once(
+    poller: &MessagePoller,
+    timeout: Option<Duration>,
+    before: Option<DateTime<Utc>>,
+) -> RoomPollResult {
+    let Some(timeout) = timeout else {
+        return RoomPollResult::Completed(Box::new(
+            poller.poll_once_transaction_before(before).await,
+        ));
+    };
+    match time::timeout(
+        effective_poll_interval(timeout),
+        poller.poll_once_transaction_before(before),
+    )
+    .await
+    {
+        Ok(result) => RoomPollResult::Completed(Box::new(result)),
+        Err(_) => RoomPollResult::TimedOut(timeout),
+    }
+}
+
+fn compare_indexed_room_messages(
+    left: &IndexedRoomMessage,
+    right: &IndexedRoomMessage,
+) -> Ordering {
+    left.message
+        .message
+        .created
+        .cmp(&right.message.message.created)
+        .then_with(|| left.message.room_id.cmp(&right.message.room_id))
+        .then_with(|| left.sequence.cmp(&right.sequence))
+        .then_with(|| left.message.message.id.cmp(&right.message.message.id))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, time::Duration};
+    use std::{
+        collections::{BTreeMap, HashSet, VecDeque},
+        time::{Duration, Instant},
+    };
 
-    use crate::types::Message;
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        task::JoinHandle,
+        time,
+    };
+    use url::Url;
+
+    use crate::{
+        Error, WebexClient,
+        types::{Message, Room},
+    };
 
     use super::{
-        SeenMessageIds, collect_page_messages, effective_poll_interval,
-        ensure_pending_within_limit, preserve_pending_on_page_error,
+        MessagePollUpdate, MessagePoller, MultiRoomMessagePoller, MultiRoomPollingConfig,
+        PollingConfig, RoomCheckpoint, RoomDiscoveryConfig, RoomPollerEntry, SeenMessageIds,
+        collect_page_messages, discover_joined_rooms, effective_poll_interval,
+        ensure_pending_within_limit, poll_tick_or_receiver_open, preserve_pending_on_page_error,
+        prune_inactive_rooms,
     };
 
     #[test]
@@ -405,6 +1306,224 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn poll_tick_stops_when_receiver_is_closed() {
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        let mut interval = time::interval(Duration::from_secs(60));
+        drop(receiver);
+
+        assert!(!poll_tick_or_receiver_open(&sender, &mut interval).await);
+    }
+
+    #[tokio::test]
+    async fn message_poller_spawn_cancels_pending_poll_when_receiver_closes() {
+        let (base_url, requests, request_started, client_closed) =
+            spawn_pending_request_server(Vec::new()).await;
+        let receiver = MessagePoller::new(client_for(base_url), "room-a")
+            .with_config(PollingConfig {
+                interval: Duration::from_millis(1),
+                ..PollingConfig::default()
+            })
+            .spawn();
+
+        time::timeout(Duration::from_secs(1), request_started)
+            .await
+            .expect("poll request did not start")
+            .unwrap();
+        drop(receiver);
+        time::timeout(Duration::from_secs(1), client_closed)
+            .await
+            .expect("pending poll did not cancel after receiver close")
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/messages?"));
+        assert!(requests[0].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_spawn_cancels_pending_poll_when_receiver_closes() {
+        let (base_url, requests, request_started, client_closed) =
+            spawn_pending_request_server(vec![MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"}]}"#,
+            )])
+            .await;
+        let receiver = MultiRoomMessagePoller::new(client_for(base_url))
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: None,
+                room_polling: PollingConfig {
+                    interval: Duration::from_millis(1),
+                    ..PollingConfig::default()
+                },
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])])
+            .spawn();
+
+        time::timeout(Duration::from_secs(1), request_started)
+            .await
+            .expect("room poll request did not start")
+            .unwrap();
+        drop(receiver);
+        time::timeout(Duration::from_secs(1), client_closed)
+            .await
+            .expect("pending room poll did not cancel after receiver close")
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[1].starts_with("GET /v1/messages?"));
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_spawn_yields_checkpoint_updates() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-existing","roomId":"room-a","text":"A existing","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let mut batches = MultiRoomMessagePoller::new(client_for(base_url))
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    interval: Duration::from_millis(1),
+                    ..PollingConfig::default()
+                },
+                ..MultiRoomPollingConfig::default()
+            })
+            .spawn();
+
+        let batch = time::timeout(Duration::from_secs(1), batches.recv())
+            .await
+            .expect("spawned batch was not received")
+            .expect("spawned batch channel closed")
+            .unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.checkpoints.len(), 1);
+        assert_eq!(batch.checkpoints[0].room_id, "room-a");
+        assert_eq!(batch.checkpoints[0].seen_message_ids, ["a-existing"]);
+
+        drop(batches);
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[test]
+    fn room_checkpoint_with_seen_ids_round_trips_through_json() {
+        let checkpoint = RoomCheckpoint::new("room-a", ["newest", "older"]);
+        let value = serde_json::to_value(&checkpoint).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "room_id": "room-a",
+                "seen_message_ids": ["newest", "older"],
+                "initialize_empty": false,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RoomCheckpoint>(value).unwrap(),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn room_checkpoint_defaults_missing_initialize_empty_to_false() {
+        let checkpoint = serde_json::from_value::<RoomCheckpoint>(json!({
+            "room_id": "room-a",
+            "seen_message_ids": ["newest"],
+        }))
+        .unwrap();
+
+        assert_eq!(checkpoint, RoomCheckpoint::new("room-a", ["newest"]));
+    }
+
+    #[test]
+    fn room_checkpoint_known_empty_round_trips_through_json() {
+        let checkpoint = RoomCheckpoint::known_empty("room-a");
+        let value = serde_json::to_value(&checkpoint).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "room_id": "room-a",
+                "seen_message_ids": [],
+                "initialize_empty": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RoomCheckpoint>(value).unwrap(),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn multi_room_poller_with_config_updates_existing_room_pollers() {
+        let old_room_polling = PollingConfig {
+            page_size: 1,
+            max_seen_ids: 3,
+            ..PollingConfig::default()
+        };
+        let new_room_polling = PollingConfig {
+            page_size: 7,
+            max_seen_ids: 1,
+            ..PollingConfig::default()
+        };
+        let mut active_poller = MessagePoller::new(dummy_client(), "room-a")
+            .with_config(old_room_polling.clone())
+            .with_seen_message_ids(["a-newer", "a-middle", "a-older"]);
+        active_poller.apply_update(MessagePollUpdate {
+            messages: Vec::new(),
+            seen_ids: vec!["a-latest".to_owned()],
+            pending_fresh: Vec::new(),
+            pending_seen_ids: Vec::new(),
+            backlog_next: None,
+            initialized: true,
+            commit_seen: true,
+        });
+        let inactive_poller = MessagePoller::new(dummy_client(), "room-b")
+            .with_config(old_room_polling)
+            .with_seen_message_ids(["b-newer", "b-older"]);
+        let mut poller = MultiRoomMessagePoller::new(dummy_client());
+        poller.rooms.insert(
+            "room-a".to_owned(),
+            RoomPollerEntry {
+                room: room("room-a"),
+                poller: active_poller,
+            },
+        );
+        poller.inactive_rooms.insert(
+            "room-b".to_owned(),
+            RoomPollerEntry {
+                room: room("room-b"),
+                poller: inactive_poller,
+            },
+        );
+
+        let poller = poller.with_config(MultiRoomPollingConfig {
+            room_polling: new_room_polling,
+            ..MultiRoomPollingConfig::default()
+        });
+
+        let active = &poller.rooms["room-a"].poller;
+        assert_eq!(active.config.page_size, 7);
+        assert_eq!(active.config.max_seen_ids, 1);
+        assert!(active.seen.contains("a-latest"));
+        assert!(!active.seen.contains("a-newer"));
+        let inactive = &poller.inactive_rooms["room-b"].poller;
+        assert_eq!(inactive.config.page_size, 7);
+        assert_eq!(inactive.config.max_seen_ids, 1);
+        assert!(inactive.seen.contains("b-newer"));
+        assert!(!inactive.seen.contains("b-older"));
+    }
+
     #[test]
     fn pending_backlog_limit_is_enforced() {
         assert!(ensure_pending_within_limit(2, 2, 2).is_ok());
@@ -412,10 +1531,1889 @@ mod tests {
         assert!(ensure_pending_within_limit(2, 3, 2).is_err());
     }
 
+    #[test]
+    fn seeded_message_poller_is_initialized() {
+        let poller = MessagePoller::new(dummy_client(), "room-1")
+            .with_config(PollingConfig {
+                max_seen_ids: 1,
+                ..PollingConfig::default()
+            })
+            .with_seen_message_ids(["newer", "older"]);
+
+        assert!(poller.initialized);
+        assert!(poller.seen.contains("newer"));
+        assert!(!poller.seen.contains("older"));
+    }
+
+    #[test]
+    fn seeded_message_poller_reapplies_final_seen_limit_when_config_changes() {
+        let poller = MessagePoller::new(dummy_client(), "room-1")
+            .with_seen_message_ids(["newer", "middle", "older"])
+            .with_config(PollingConfig {
+                max_seen_ids: 2,
+                ..PollingConfig::default()
+            });
+
+        assert!(poller.initialized);
+        assert!(poller.seen.contains("newer"));
+        assert!(poller.seen.contains("middle"));
+        assert!(!poller.seen.contains("older"));
+    }
+
+    #[test]
+    fn empty_seeded_message_poller_is_not_initialized() {
+        let poller = MessagePoller::new(dummy_client(), "room-1")
+            .with_seen_message_ids(std::iter::empty::<&str>());
+
+        assert!(!poller.initialized);
+        assert!(poller.seen.ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovers_joined_rooms_with_query_config() {
+        let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
+            r#"{"items":[{"id":"room-1","title":"Room 1"}]}"#,
+        )])
+        .await;
+        let client = client_for(base_url);
+
+        let rooms = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                page_size: 25,
+                max_rooms: 10,
+                room_type: Some("group".to_owned()),
+                team_id: Some("team-1".to_owned()),
+                sort_by: Some("lastactivity".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id.as_deref(), Some("room-1"));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[0].contains("max=25"));
+        assert!(requests[0].contains("type=group"));
+        assert!(requests[0].contains("teamId=team-1"));
+        assert!(requests[0].contains("sortBy=lastactivity"));
+    }
+
+    #[tokio::test]
+    async fn discover_joined_rooms_rejects_exact_limit_with_next_page() {
+        let (base_url, requests) = spawn_two_page_room_server(
+            r#"{"items":[{"id":"room-1"}]}"#,
+            r#"{"items":[{"id":"room-2"}]}"#,
+        )
+        .await;
+        let client = client_for(base_url);
+
+        let error = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("joined-room discovery exceeded max_rooms=1")
+        );
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_joined_rooms_deduplicates_before_max_room_limit() {
+        let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
+            r#"{"items":[{"id":"room-1","title":"Room 1"},{"id":"room-1","title":"Room 1 Updated"}]}"#,
+        )])
+        .await;
+        let client = client_for(base_url);
+
+        let rooms = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id.as_deref(), Some("room-1"));
+        assert_eq!(rooms[0].title.as_deref(), Some("Room 1 Updated"));
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discover_joined_rooms_deduplicates_across_pages_before_max_room_limit() {
+        let (base_url, requests) = spawn_two_page_room_server(
+            r#"{"items":[{"id":"room-1","title":"Room 1"}]}"#,
+            r#"{"items":[{"id":"room-1","title":"Room 1 Updated"}]}"#,
+        )
+        .await;
+        let client = client_for(base_url);
+
+        let rooms = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id.as_deref(), Some("room-1"));
+        assert_eq!(rooms[0].title.as_deref(), Some("Room 1 Updated"));
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_joined_rooms_rejects_room_count_over_limit() {
+        let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
+            r#"{"items":[{"id":"room-1"},{"id":"room-2"}]}"#,
+        )])
+        .await;
+        let client = client_for(base_url);
+
+        let error = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("joined-room discovery exceeded max_rooms=1")
+        );
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_deduplicates_discovery_without_losing_checkpoint() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-a","title":"Room A Updated"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let events = poller.poll_once().await.unwrap().events;
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(poller.room_ids(), ["room-a"]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(messages[0].room.title.as_deref(), Some("Room A Updated"));
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_restores_state_when_room_reappears() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A Restored"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+
+        let missing_events = poller.poll_once().await.unwrap().events;
+        assert!(missing_events.is_empty());
+        assert!(poller.room_ids().is_empty());
+
+        let restored_events = poller.poll_once().await.unwrap().events;
+        let restored_messages = restored_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert_eq!(
+            restored_messages[0].room.title.as_deref(),
+            Some("Room A Restored")
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[4].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_does_not_block_on_pending_inactive_room() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+                MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+        let restored_events = poller.poll_once().await.unwrap().events;
+
+        assert!(first_events.is_empty());
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["b-later"]
+        );
+        assert_eq!(
+            restored_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[3].starts_with("GET /v1/rooms?"));
+        assert!(requests[4].starts_with("GET /v1/rooms?"));
+        assert!(requests[5].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_refreshes_immediately_after_discovery_config_change() {
+        let (base_url, requests) = spawn_route_server(
+            vec![
+                (
+                    "teamId=team-1",
+                    MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+                ),
+                (
+                    "GET /v1/rooms?",
+                    MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"b-existing","roomId":"room-b","text":"B existing","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client);
+
+        poller.refresh_rooms().await.unwrap();
+        let mut poller = poller.with_config(MultiRoomPollingConfig {
+            discovery: RoomDiscoveryConfig {
+                team_id: Some("team-1".to_owned()),
+                ..RoomDiscoveryConfig::default()
+            },
+            ..MultiRoomPollingConfig::default()
+        });
+
+        let batch = poller.poll_once().await.unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(poller.room_ids(), ["room-b"]);
+        assert_eq!(batch.checkpoints[0].room_id, "room-b");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("teamId=team-1"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(!requests[2].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_applies_checkpoint_after_room_discovery() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client);
+
+        poller.refresh_rooms().await.unwrap();
+        let mut poller = poller.with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+        let events = poller.poll_once().await.unwrap().events;
+
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap().message.id.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["a-new"]);
+        assert!(!poller.checkpoints.contains_key("room-a"));
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_empty_checkpoint_establishes_baseline() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-existing","roomId":"room-a","text":"A existing","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", Vec::<String>::new())]);
+
+        let batch = poller.poll_once().await.unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.checkpoints.len(), 1);
+        assert_eq!(batch.checkpoints[0].room_id, "room-a");
+        assert_eq!(batch.checkpoints[0].seen_message_ids, ["a-existing"]);
+        assert_eq!(requests.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_prunes_inactive_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-c","title":"Room C"}]}"#),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client).with_config(MultiRoomPollingConfig {
+            max_inactive_rooms: 1,
+            ..MultiRoomPollingConfig::default()
+        });
+
+        poller.refresh_rooms().await.unwrap();
+        poller.refresh_rooms().await.unwrap();
+        poller.refresh_rooms().await.unwrap();
+
+        assert_eq!(poller.room_ids(), ["room-c"]);
+        assert_eq!(
+            poller.inactive_rooms.keys().cloned().collect::<Vec<_>>(),
+            ["room-b"]
+        );
+        assert_eq!(
+            poller.inactive_room_order,
+            VecDeque::from(["room-b".to_owned()])
+        );
+        assert_eq!(requests.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_reuses_checkpoint_after_pruning_inactive_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-c","title":"Room C"}]}"#),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                max_inactive_rooms: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.checkpoints.contains_key("room-a"));
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(requests.await.unwrap().len(), 8);
+    }
+
+    #[test]
+    fn prune_inactive_rooms_retains_pending_backlog_states() {
+        let mut pending_poller = MessagePoller::new(dummy_client(), "room-a");
+        pending_poller.pending_fresh = vec![message("a-pending")];
+        let idle_poller = MessagePoller::new(dummy_client(), "room-b").with_empty_seen_boundary();
+        let mut inactive_rooms = BTreeMap::new();
+        inactive_rooms.insert(
+            "room-a".to_owned(),
+            RoomPollerEntry {
+                room: Room {
+                    id: Some("room-a".to_owned()),
+                    ..Room::default()
+                },
+                poller: pending_poller,
+            },
+        );
+        inactive_rooms.insert(
+            "room-b".to_owned(),
+            RoomPollerEntry {
+                room: Room {
+                    id: Some("room-b".to_owned()),
+                    ..Room::default()
+                },
+                poller: idle_poller,
+            },
+        );
+        let mut inactive_room_order = VecDeque::from(["room-a".to_owned(), "room-b".to_owned()]);
+        let mut checkpoints = BTreeMap::new();
+
+        prune_inactive_rooms(
+            &mut inactive_rooms,
+            &mut inactive_room_order,
+            &mut checkpoints,
+            1,
+        );
+
+        assert!(inactive_rooms.contains_key("room-a"));
+        assert!(!inactive_rooms.contains_key("room-b"));
+        assert_eq!(inactive_room_order, VecDeque::from(["room-a".to_owned()]));
+        assert!(!checkpoints.contains_key("room-a"));
+        assert_eq!(checkpoints.get("room-b"), Some(&(Vec::new(), true)));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_discovers_rooms_and_emits_checkpointed_catchup() {
+        let (base_url, requests) = spawn_route_server(
+            vec![
+                (
+                    "/v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-b","title":"Room B"},{"id":"room-a","title":"Room A"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:02Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:01Z"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:01Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let events = poller.poll_once().await.unwrap().events;
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(poller.room_ids(), ["room-a", "room-b"]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["b-new", "a-new"]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.room.title.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["Room B", "Room A"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].starts_with("GET /v1/messages?"));
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].starts_with("GET /v1/messages?"));
+        assert!(requests[2].contains("roomId=room-b"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_uses_shared_cutoff_for_room_batch() {
+        let (base_url, requests) = spawn_route_server(
+            vec![
+                (
+                    "GET /v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-b","title":"Room B"},{"id":"room-a","title":"Room A"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:02Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:01Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let events = poller.poll_once().await.unwrap().events;
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap().message.id.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, ["b-new", "a-new"]);
+
+        let requests = requests.await.unwrap();
+        let message_requests = requests
+            .iter()
+            .filter(|request| request.starts_with("GET /v1/messages?"))
+            .collect::<Vec<_>>();
+        assert_eq!(message_requests.len(), 2);
+        let first_before = request_query_value(message_requests[0], "before").unwrap();
+        let second_before = request_query_value(message_requests[1], "before").unwrap();
+        assert_eq!(first_before, second_before);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_preserves_room_order_for_equal_timestamps() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-first-api","roomId":"room-a","text":"A first","created":"2026-06-17T00:00:01Z"},{"id":"z-second-api","roomId":"room-a","text":"A second","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["z-second-api", "a-first-api"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_holds_messages_until_room_backlogs_drain() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+        let messages = second_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(first_events.is_empty());
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer", "b-later"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(requests[3].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_holds_messages_when_pending_backlog_room_fails() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::status_json(
+                    "503 Service Unavailable",
+                    r#"{"message":"room a unavailable"}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+        let third_events = poller.poll_once().await.unwrap().events;
+        let second_errors = second_events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect::<Vec<_>>();
+        let third_messages = third_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(first_events.is_empty());
+        assert_eq!(second_errors.len(), 1);
+        assert!(second_events.iter().all(Result::is_err));
+        assert_eq!(
+            third_messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer", "b-later"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(requests[3].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[4].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_holds_messages_when_pending_backlog_room_times_out() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::delay_json(
+                    Duration::from_millis(50),
+                    r#"{"items":[{"id":"too-late","roomId":"room-a","text":"Too late","created":"2026-06-17T00:00:02Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                room_poll_timeout: None,
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        poller.config.room_poll_timeout = Some(Duration::from_millis(1));
+        let second_events = poller.poll_once().await.unwrap().events;
+        poller.config.room_poll_timeout = None;
+        let third_events = poller.poll_once().await.unwrap().events;
+
+        assert!(first_events.is_empty());
+        assert!(second_events.iter().all(Result::is_err));
+        assert_eq!(
+            third_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-older", "a-newer", "b-later"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[3].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[4].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_known_empty_checkpoint_emits_catchup() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::known_empty("room-a")]);
+
+        let events = poller.poll_once().await.unwrap().events;
+        let messages = events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_returns_checkpoint_updates_for_baselines() {
+        let (base_url, _requests) = spawn_route_server(
+            vec![
+                (
+                    "/v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"a-existing","roomId":"room-a","text":"A existing","created":"2026-06-17T00:00:01Z"}]}"#,
+                    ),
+                ),
+                ("roomId=room-b", MockResponse::json(r#"{"items":[]}"#)),
+            ],
+            3,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client);
+
+        let batch = poller.poll_once().await.unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(
+            batch.checkpoints,
+            vec![
+                RoomCheckpoint::new("room-a", ["a-existing"]),
+                RoomCheckpoint::known_empty("room-b"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_commits_empty_baseline_while_other_room_has_backlog() {
+        let (base_url, requests) = spawn_sequence_server_with_address(|address| {
+            let next = format!(r#"<http://{address}/v1/messages?page=2>; rel="next""#);
+            vec![
+                MockResponse::json(
+                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-newer","roomId":"room-a","text":"A newer","created":"2026-06-17T00:00:03Z"}]}"#,
+                )
+                .with_header("Link", next),
+                MockResponse::json(r#"{"items":[]}"#),
+                MockResponse::json(
+                    r#"{"items":[{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                ),
+                MockResponse::json(
+                    r#"{"items":[{"id":"b-after-baseline","roomId":"room-b","text":"B after","created":"2026-06-17T00:00:04Z"}]}"#,
+                ),
+            ]
+        })
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    page_size: 10,
+                    max_pages_per_poll: 1,
+                    ..PollingConfig::default()
+                },
+                max_concurrent_room_polls: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+        let messages = second_events
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(first_events.is_empty());
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-newer", "b-after-baseline"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(requests[3].starts_with("GET /v1/messages?page=2"));
+        assert!(requests[4].contains("roomId=room-b"));
+    }
+
+    fn room(id: &str) -> Room {
+        Room {
+            id: Some(id.to_owned()),
+            ..Room::default()
+        }
+    }
+
     fn message(id: &str) -> Message {
         Message {
             id: Some(id.to_owned()),
             ..Message::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_times_out_hung_room_poll() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_secs(60),
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: Some(Duration::from_millis(1)),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(events.len(), 1);
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        match error {
+            Error::RoomPoll { room_id, source } => {
+                assert_eq!(room_id, "room-a");
+                assert!(source.to_string().contains("room poll timed out"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_cancellation_keeps_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_millis(50),
+                r#"{"items":[{"id":"stale","roomId":"room-a","text":"stale","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: None,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(1), poller.poll_once())
+            .await
+            .unwrap_err();
+
+        assert_eq!(poller.room_ids(), ["room-a"]);
+        let events = poller.poll_once().await.unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_cancellation_after_fast_room_keeps_seen_state_uncommitted() {
+        let (base_url, _requests) = spawn_route_server(
+            vec![
+                (
+                    "/v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::delay_json(
+                        Duration::from_millis(50),
+                        r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:02Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            5,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                max_concurrent_room_polls: 2,
+                room_poll_timeout: None,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+            ]);
+
+        poller.refresh_rooms().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(10), poller.poll_once())
+            .await
+            .unwrap_err();
+
+        assert_eq!(poller.room_ids(), ["room-a", "room-b"]);
+        let events = poller.poll_once().await.unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new", "b-new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_polls_later_room_while_earlier_rooms_timeout() {
+        let (base_url, _requests) = spawn_route_server(
+            vec![
+                (
+                    "/v1/rooms?",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"},{"id":"room-c","title":"Room C"}]}"#,
+                    ),
+                ),
+                (
+                    "roomId=room-a",
+                    MockResponse::delay_json(Duration::from_secs(60), r#"{"items":[]}"#),
+                ),
+                (
+                    "roomId=room-b",
+                    MockResponse::delay_json(Duration::from_secs(60), r#"{"items":[]}"#),
+                ),
+                (
+                    "roomId=room-c",
+                    MockResponse::json(
+                        r#"{"items":[{"id":"c-new","roomId":"room-c","text":"C new","created":"2026-06-17T00:00:02Z"},{"id":"c-seen","roomId":"room-c","text":"C seen","created":"2026-06-17T00:00:00Z"}]}"#,
+                    ),
+                ),
+            ],
+            4,
+        )
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: Some(Duration::from_millis(10)),
+                max_concurrent_room_polls: 3,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([
+                RoomCheckpoint::new("room-a", ["a-seen"]),
+                RoomCheckpoint::new("room-b", ["b-seen"]),
+                RoomCheckpoint::new("room-c", ["c-seen"]),
+            ]);
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["c-new"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_reports_room_error_without_dropping_other_rooms() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"},{"id":"room-c","title":"Room C"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::status_json(
+                "500 Internal Server Error",
+                r#"{"message":"room b unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"c-new","roomId":"room-c","text":"C new","created":"2026-06-17T00:00:02Z"},{"id":"c-seen","roomId":"room-c","text":"C seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client).with_room_checkpoints([
+            RoomCheckpoint::new("room-a", ["a-seen"]),
+            RoomCheckpoint::new("room-b", ["b-seen"]),
+            RoomCheckpoint::new("room-c", ["c-seen"]),
+        ]);
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new", "c-new"]
+        );
+        let errors = events
+            .iter()
+            .filter_map(|event| event.as_ref().err())
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        match errors[0] {
+            Error::RoomPoll { room_id, source } => {
+                assert_eq!(room_id, "room-b");
+                assert!(source.to_string().contains("500 Internal Server Error"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-b"));
+        assert!(requests[3].contains("roomId=room-c"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_rebuild_replays_successes_from_discarded_error_batch() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::status_json(
+                "500 Internal Server Error",
+                r#"{"message":"room b unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"b-new","roomId":"room-b","text":"B new","created":"2026-06-17T00:00:02Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let config = MultiRoomPollingConfig {
+            max_concurrent_room_polls: 1,
+            ..MultiRoomPollingConfig::default()
+        };
+        let checkpoints = [
+            RoomCheckpoint::new("room-a", ["a-seen"]),
+            RoomCheckpoint::new("room-b", ["b-seen"]),
+        ];
+        let mut first = MultiRoomMessagePoller::new(client_for(base_url.clone()))
+            .with_config(config.clone())
+            .with_room_checkpoints(checkpoints.clone());
+
+        let first_batch = first.poll_once().await.unwrap();
+
+        assert_eq!(
+            first_batch
+                .events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_batch
+                .events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+        assert_eq!(first_batch.checkpoints.len(), 1);
+        assert_eq!(first_batch.checkpoints[0].room_id, "room-a");
+
+        let mut rebuilt = MultiRoomMessagePoller::new(client_for(base_url))
+            .with_config(config)
+            .with_room_checkpoints(checkpoints);
+        let retry_events = rebuilt.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            retry_events
+                .iter()
+                .map(|event| event.as_ref().unwrap().message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new", "b-new"]
+        );
+        assert_eq!(requests.await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_times_out_hung_refresh_and_polls_existing_rooms() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_secs(60),
+                r#"{"items":[{"id":"room-a","title":"Room A"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: Some(Duration::from_millis(1)),
+                room_refresh_interval: Duration::ZERO,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.config.room_discovery_timeout = None;
+        poller.refresh_rooms().await.unwrap();
+        poller.config.room_discovery_timeout = Some(Duration::from_millis(1));
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_cancelled_refresh_does_not_advance_retry_interval() {
+        let (base_url, _requests) = spawn_tolerant_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_millis(50),
+                r#"{"items":[{"id":"room-a","title":"Room A"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: None,
+                room_refresh_interval: Duration::from_secs(60),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        let previous_discovery = Instant::now() - Duration::from_secs(120);
+        poller.last_room_discovery = Some(previous_discovery);
+        tokio::time::timeout(Duration::from_millis(1), poller.poll_once())
+            .await
+            .unwrap_err();
+
+        assert_eq!(poller.last_room_discovery, Some(previous_discovery));
+        assert!(poller.room_refresh_due());
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_slow_refresh_timeout_starts_retry_interval_after_failure() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(Duration::from_millis(50), r#"{"items":[]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_discovery_timeout: Some(Duration::from_millis(1)),
+                room_refresh_interval: Duration::from_secs(60),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.config.room_discovery_timeout = None;
+        poller.refresh_rooms().await.unwrap();
+        poller.config.room_discovery_timeout = Some(Duration::from_millis(1));
+        poller.last_room_discovery = Some(Instant::now() - Duration::from_secs(120));
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert!(second_events.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_refresh_failure_is_throttled_by_refresh_interval() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::status_json(
+                "503 Service Unavailable",
+                r#"{"message":"room discovery unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::from_secs(60),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        poller.last_room_discovery = Some(Instant::now() - Duration::from_secs(120));
+
+        let first_events = poller.poll_once().await.unwrap().events;
+        let second_events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert!(second_events.iter().all(Result::is_ok));
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[1].starts_with("GET /v1/rooms?"));
+        assert!(requests[2].contains("roomId=room-a"));
+        assert!(requests[3].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_refresh_failure_does_not_stop_existing_room_polling() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::status_json(
+                "503 Service Unavailable",
+                r#"{"message":"room discovery unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[1].starts_with("GET /v1/rooms?"));
+        assert!(requests[2].contains("roomId=room-a"));
+    }
+
+    fn dummy_client() -> WebexClient {
+        WebexClient::from_access_token("token").unwrap()
+    }
+
+    fn client_for(base_url: Url) -> WebexClient {
+        WebexClient::builder()
+            .unwrap()
+            .base_url(base_url)
+            .access_token("token")
+            .build()
+            .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: &'static str,
+        headers: Vec<(&'static str, String)>,
+        delay: Option<Duration>,
+        body: String,
+    }
+
+    impl MockResponse {
+        fn json(body: impl Into<String>) -> Self {
+            Self::status_json("200 OK", body)
+        }
+
+        fn status_json(status: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                delay: None,
+                body: body.into(),
+            }
+        }
+
+        fn delay_json(delay: Duration, body: impl Into<String>) -> Self {
+            Self {
+                delay: Some(delay),
+                ..Self::json(body)
+            }
+        }
+
+        fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+            self.headers.push((name, value.into()));
+            self
+        }
+    }
+
+    async fn spawn_two_page_room_server(
+        first_body: &str,
+        second_body: &str,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let link = format!(r#"<http://{address}/v1/rooms?page=2>; rel="next""#);
+        let responses = VecDeque::from(vec![
+            MockResponse::json(first_body).with_header("Link", link),
+            MockResponse::json(second_body),
+        ]);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = responses;
+            while let Some(response) = responses.pop_front() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                write_mock_response(&mut stream, response).await;
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+        )
+    }
+
+    fn request_query_value<'a>(request: &'a str, key: &str) -> Option<&'a str> {
+        let path = request.split_whitespace().nth(1)?;
+        let (_, query) = path.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == key).then_some(value)
+        })
+    }
+
+    async fn spawn_pending_request_server(
+        responses_before_pending: Vec<MockResponse>,
+    ) -> (
+        Url,
+        JoinHandle<Vec<String>>,
+        oneshot::Receiver<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_started_tx, request_started_rx) = oneshot::channel();
+        let (client_closed_tx, client_closed_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = VecDeque::from(responses_before_pending);
+            while let Some(response) = responses.pop_front() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                write_mock_response(&mut stream, response).await;
+            }
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            let _ = request_started_tx.send(());
+            let mut buffer = [0_u8; 1];
+            let _ = stream.read(&mut buffer).await;
+            let _ = client_closed_tx.send(());
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+            request_started_rx,
+            client_closed_rx,
+        )
+    }
+
+    async fn spawn_sequence_server_with_address<F>(
+        make_responses: F,
+    ) -> (Url, JoinHandle<Vec<String>>)
+    where
+        F: FnOnce(std::net::SocketAddr) -> Vec<MockResponse>,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = make_responses(address);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = VecDeque::from(responses);
+            while let Some(response) = responses.pop_front() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                write_mock_response(&mut stream, response).await;
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+        )
+    }
+
+    async fn spawn_sequence_server(responses: Vec<MockResponse>) -> (Url, JoinHandle<Vec<String>>) {
+        spawn_sequence_server_with_options(responses, false).await
+    }
+
+    async fn spawn_tolerant_sequence_server(
+        responses: Vec<MockResponse>,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        spawn_sequence_server_with_options(responses, true).await
+    }
+
+    async fn spawn_sequence_server_with_options(
+        responses: Vec<MockResponse>,
+        allow_abandoned_connections: bool,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = VecDeque::from(responses);
+            let mut response_tasks = Vec::new();
+            while !responses.is_empty() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = if allow_abandoned_connections {
+                    let Some(request) = read_http_request_opt(&mut stream, false).await else {
+                        continue;
+                    };
+                    request
+                } else {
+                    read_http_request(&mut stream).await
+                };
+                let response = responses.pop_front().unwrap();
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                response_tasks.push(tokio::spawn(async move {
+                    write_mock_response(&mut stream, response).await;
+                }));
+            }
+            for task in response_tasks {
+                task.await.unwrap();
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+        )
+    }
+
+    async fn spawn_route_server(
+        routes: Vec<(&'static str, MockResponse)>,
+        expected_requests: usize,
+    ) -> (Url, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut response_tasks = Vec::new();
+            while requests.len() < expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some(request) = read_http_request_opt(&mut stream, false).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let response = routes
+                    .iter()
+                    .find(|(needle, _)| request.contains(needle))
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(|| {
+                        MockResponse::status_json(
+                            "404 Not Found",
+                            format!(r#"{{"message":"no route for {request:?}"}}"#),
+                        )
+                    });
+                requests.push(request);
+                response_tasks.push(tokio::spawn(async move {
+                    write_mock_response(&mut stream, response).await;
+                }));
+            }
+            for task in response_tasks {
+                task.await.unwrap();
+            }
+            requests
+        });
+
+        (
+            Url::parse(&format!("http://{address}/v1/")).unwrap(),
+            server,
+        )
+    }
+
+    async fn write_mock_response(stream: &mut tokio::net::TcpStream, response: MockResponse) {
+        if let Some(delay) = response.delay {
+            tokio::time::sleep(delay).await;
+        }
+        let mut headers = String::new();
+        for (name, value) in response.headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.status,
+            headers,
+            response.body.len(),
+            response.body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        read_http_request_opt(stream, true)
+            .await
+            .expect("client closed before request completed")
+    }
+
+    async fn read_http_request_opt(
+        stream: &mut tokio::net::TcpStream,
+        assert_complete: bool,
+    ) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                if assert_complete {
+                    panic!("client closed before request completed");
+                }
+                return None;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Some(bytes);
+            }
         }
     }
 }

@@ -8,7 +8,11 @@ use thiserror::Error as ThisError;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors returned by the Webex client and OAuth helpers.
+///
+/// This enum is non-exhaustive so the crate can add structured errors as new
+/// Webex surfaces are wrapped.
 #[derive(Debug, ThisError)]
+#[non_exhaustive]
 pub enum Error {
     #[error("http client error: {0}")]
     Http(#[from] reqwest::Error),
@@ -20,6 +24,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("webex api error: {0}")]
     Api(Box<ApiError>),
+    #[error("room {room_id} poll failed: {source}")]
+    RoomPoll {
+        room_id: String,
+        #[source]
+        source: Box<Error>,
+    },
     #[error("no usable access token is available")]
     MissingToken,
     #[error("oauth flow is still pending")]

@@ -25,7 +25,10 @@ pub use auth::{
 pub use client::{ClientBuilder, WebexClient};
 pub use error::{ApiError, Error, Result};
 pub use pagination::Page;
-pub use realtime::{MessagePoller, PollingConfig};
+pub use realtime::{
+    MessagePoller, MultiRoomMessagePoller, MultiRoomPoll, MultiRoomPollingConfig, PollingConfig,
+    RoomCheckpoint, RoomDiscoveryConfig, RoomMessage, discover_joined_rooms,
+};
 pub use rooms::room_id_candidates_from_link;
 pub use sidecar::SidecarEvent;
 
