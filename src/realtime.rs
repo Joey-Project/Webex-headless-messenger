@@ -527,9 +527,13 @@ impl MultiRoomMessagePoller {
     async fn poll_rooms_concurrently(&mut self) -> Vec<Result<RoomMessage>> {
         let timeout = self.config.room_poll_timeout;
         let max_concurrent = self.config.max_concurrent_room_polls.max(1);
-        let mut remaining_rooms = std::mem::take(&mut self.rooms).into_iter();
+        let mut remaining_rooms = self
+            .rooms
+            .iter()
+            .map(|(room_id, entry)| (room_id.clone(), entry.clone()))
+            .collect::<VecDeque<_>>()
+            .into_iter();
         let mut join_set = JoinSet::new();
-        let mut restored_rooms = BTreeMap::new();
         let mut events = Vec::new();
 
         for _ in 0..max_concurrent {
@@ -541,25 +545,36 @@ impl MultiRoomMessagePoller {
 
         while let Some(joined) = join_set.join_next().await {
             match joined {
-                Ok((room_id, entry, poll_result)) => {
-                    let room = entry.room.clone();
-                    restored_rooms.insert(room_id.clone(), entry);
-                    match poll_result {
-                        Ok(room_messages) => {
-                            for message in room_messages {
-                                events.push(Ok(RoomMessage {
-                                    room_id: room_id.clone(),
-                                    room: room.clone(),
-                                    message,
-                                }));
-                            }
+                Ok((room_id, entry, poll_result)) => match poll_result {
+                    RoomPollResult::Completed(result) => {
+                        let room = entry.room.clone();
+                        if let Some(current) = self.rooms.get_mut(&room_id) {
+                            *current = entry;
                         }
-                        Err(source) => events.push(Err(Error::RoomPoll {
-                            room_id,
-                            source: Box::new(source),
-                        })),
+                        match result {
+                            Ok(room_messages) => {
+                                for message in room_messages {
+                                    events.push(Ok(RoomMessage {
+                                        room_id: room_id.clone(),
+                                        room: room.clone(),
+                                        message,
+                                    }));
+                                }
+                            }
+                            Err(source) => events.push(Err(Error::RoomPoll {
+                                room_id,
+                                source: Box::new(source),
+                            })),
+                        }
                     }
-                }
+                    RoomPollResult::TimedOut(timeout) => events.push(Err(Error::RoomPoll {
+                        room_id,
+                        source: Box::new(Error::Other(format!(
+                            "room poll timed out after {:?}",
+                            effective_poll_interval(timeout)
+                        ))),
+                    })),
+                },
                 Err(error) => {
                     events.push(Err(Error::Other(format!("room poll task failed: {error}"))))
                 }
@@ -570,7 +585,6 @@ impl MultiRoomMessagePoller {
             }
         }
 
-        self.rooms = restored_rooms;
         events
     }
 
@@ -633,8 +647,13 @@ async fn discover_joined_rooms_with_timeout(
     }
 }
 
+enum RoomPollResult {
+    Completed(Result<Vec<ListMessage>>),
+    TimedOut(Duration),
+}
+
 fn spawn_room_poll(
-    join_set: &mut JoinSet<(String, RoomPollerEntry, Result<Vec<ListMessage>>)>,
+    join_set: &mut JoinSet<(String, RoomPollerEntry, RoomPollResult)>,
     room_id: String,
     mut entry: RoomPollerEntry,
     timeout: Option<Duration>,
@@ -645,19 +664,13 @@ fn spawn_room_poll(
     });
 }
 
-async fn poll_room_once(
-    poller: &mut MessagePoller,
-    timeout: Option<Duration>,
-) -> Result<Vec<ListMessage>> {
+async fn poll_room_once(poller: &mut MessagePoller, timeout: Option<Duration>) -> RoomPollResult {
     let Some(timeout) = timeout else {
-        return poller.poll_once().await;
+        return RoomPollResult::Completed(poller.poll_once().await);
     };
     match time::timeout(effective_poll_interval(timeout), poller.poll_once()).await {
-        Ok(result) => result,
-        Err(_) => Err(Error::Other(format!(
-            "room poll timed out after {:?}",
-            effective_poll_interval(timeout)
-        ))),
+        Ok(result) => RoomPollResult::Completed(result),
+        Err(_) => RoomPollResult::TimedOut(timeout),
     }
 }
 
@@ -1013,6 +1026,49 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_cancellation_keeps_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_millis(50),
+                r#"{"items":[{"id":"stale","roomId":"room-a","text":"stale","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: None,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(1), poller.poll_once())
+            .await
+            .unwrap_err();
+
+        assert_eq!(poller.room_ids(), ["room-a"]);
+        let events = poller.poll_once().await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("roomId=room-a"));
+        assert!(requests[2].contains("roomId=room-a"));
     }
 
     #[tokio::test]
