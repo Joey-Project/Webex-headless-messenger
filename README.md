@@ -24,6 +24,8 @@ Implemented in the first slice:
 - RFC5988 `Link` header pagination.
 - Structured API errors with `trackingId` and `Retry-After` when available.
 - Polling-based message receiver for deployments without public HTTP ingress.
+- Joined-room discovery and multi-room REST catch-up primitives for generic
+  account recovery across every joined space.
 - Local file upload helper for `multipart/form-data` message creation.
 - JavaScript SDK realtime sidecar demo that forwards normalized message events
   to a local Rust loopback receiver.
@@ -279,6 +281,45 @@ async fn main() -> webex_headless_messenger::Result<()> {
 
 Polling is intentionally conservative. It de-duplicates by message ID in memory
 and skips existing messages on the first poll by default.
+
+For generic-account services that must recover gaps across every joined space,
+use `discover_joined_rooms` or `MultiRoomMessagePoller`. Seed
+`RoomCheckpoint` with newest-first message IDs from durable state for rooms that
+were processed before restart; newly discovered rooms without checkpoints only
+establish a baseline on their first poll.
+
+```rust
+use std::time::Duration;
+
+use webex_headless_messenger::{
+    MultiRoomMessagePoller, MultiRoomPollingConfig, PollingConfig, RoomCheckpoint, WebexClient,
+};
+
+#[tokio::main]
+async fn main() -> webex_headless_messenger::Result<()> {
+    let client = WebexClient::from_access_token(std::env::var("WEBEX_ACCESS_TOKEN").unwrap())?;
+    let mut events = MultiRoomMessagePoller::new(client)
+        .with_config(MultiRoomPollingConfig {
+            room_polling: PollingConfig {
+                interval: Duration::from_secs(10),
+                ..PollingConfig::default()
+            },
+            ..MultiRoomPollingConfig::default()
+        })
+        .with_room_checkpoints([RoomCheckpoint::new(
+            "room-id-from-store",
+            ["newest-seen-message-id"],
+        )])
+        .spawn();
+
+    while let Some(event) = events.recv().await {
+        let room_message = event?;
+        println!("{} {:?}", room_message.room_id, room_message.message.text);
+    }
+
+    Ok(())
+}
+```
 
 ## Realtime Sidecar
 
