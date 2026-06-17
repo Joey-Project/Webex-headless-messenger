@@ -20,6 +20,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("webex api error: {0}")]
     Api(Box<ApiError>),
+    #[error("room {room_id} poll failed: {source}")]
+    RoomPoll {
+        room_id: String,
+        #[source]
+        source: Box<Error>,
+    },
     #[error("no usable access token is available")]
     MissingToken,
     #[error("oauth flow is still pending")]
