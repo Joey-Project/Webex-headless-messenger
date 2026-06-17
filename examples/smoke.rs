@@ -11,9 +11,9 @@ use std::{
 };
 
 use tokio::time::sleep;
-use url::Url;
 use webex_headless_messenger::{
     DeviceTokenStatus, OAuthClient, OAuthConfig, TokenSet, WebexClient,
+    room_id_candidates_from_link,
     types::{CreateMessage, ListDirectMessages, ListMemberships, ListMessages, ListRooms, Room},
 };
 
@@ -272,48 +272,6 @@ mod tests {
             &token(&["spark:messages_read", "spark:kms"]),
             &requested,
         ));
-    }
-}
-
-fn room_id_candidates_from_link(link: &str) -> Vec<String> {
-    let Ok(url) = Url::parse(link.trim()) else {
-        return Vec::new();
-    };
-    let mut candidates = Vec::new();
-    for segment in url.path_segments().into_iter().flatten() {
-        push_candidate(&mut candidates, segment);
-    }
-    for (key, value) in url.query_pairs() {
-        if key.to_ascii_lowercase().contains("room")
-            || key.to_ascii_lowercase().contains("space")
-            || key.to_ascii_lowercase().contains("conversation")
-        {
-            push_candidate(&mut candidates, &value);
-        }
-    }
-    if let Some(fragment) = url.fragment() {
-        for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
-            if key.to_ascii_lowercase().contains("room")
-                || key.to_ascii_lowercase().contains("space")
-                || key.to_ascii_lowercase().contains("conversation")
-            {
-                push_candidate(&mut candidates, &value);
-            }
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn push_candidate(candidates: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if value.len() >= 16
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '/' | '='))
-    {
-        candidates.push(value.to_owned());
     }
 }
 

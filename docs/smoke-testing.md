@@ -85,7 +85,8 @@ Room resolution uses the first available value:
 
 - `WEBEX_TEST_ROOM_ID`: exact Webex room ID.
 - `WEBEX_TEST_ROOM_LINK`: Webex app or browser link. The smoke example extracts
-  room-like candidates and verifies them with `GET /v1/rooms/{id}`.
+  room-like candidates, derives REST room IDs from `webexteams://im?space=<uuid>`
+  links, and verifies them with `GET /v1/rooms/{id}`.
 - `WEBEX_TEST_ROOM_TITLE`: unique room title visible to the generic account.
 
 `WEBEX_TEST_PERSON_EMAIL` is optional. When present, the smoke example attempts
