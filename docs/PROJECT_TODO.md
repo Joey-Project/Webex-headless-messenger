@@ -1,6 +1,5 @@
 # Project TODO
 
-- [next] Add an append-only JSONL state log for correctness state such as processed messages, room checkpoints, and attempt leases, with rebuildable in-memory indexes.
 - [next] Add an optional SQLite cache/index over the JSONL source of truth if the first deployment needs faster processed-message and checkpoint lookups.
 - [next] Build a thin production generic-account bot layer around the current `examples/account_bot.rs`: configurable rule dispatch, app-specific handler tests, production env template, and a named service/binary target.
 - [deferred] Adaptive Card 暂保留 raw JSON attachment payload，不做复杂 builder/DSL；有实际卡片需求后再评估。

@@ -365,6 +365,49 @@ async fn main() -> webex_headless_messenger::Result<()> {
 }
 ```
 
+## Durable JSONL State
+
+`JsonlStateStore` provides the first built-in persistence layer for generic-account
+services. It writes append-only JSONL records for processed message IDs, room
+checkpoints, and bounded attempt leases, then rebuilds an in-memory
+`StateSnapshot` on startup. Store mutations reload the latest file state under an
+in-process path lock before appending, and startup repairs an incomplete trailing
+record left by an interrupted append. Processed message IDs are not capped in the
+JSONL source of truth; add a cache/index layer separately if the deployment needs
+faster lookup over a large log. Treat one JSONL file as a single-process writer;
+use an external lock or a database-backed layer if multiple OS processes need to
+write the same state file concurrently.
+
+```rust
+use std::time::Duration;
+
+use webex_headless_messenger::{AttemptStart, JsonlStateStore, RoomMessage};
+
+fn handle_room_message(
+    state: &mut JsonlStateStore,
+    room_message: &RoomMessage,
+) -> webex_headless_messenger::Result<()> {
+    let Some(message_id) = room_message.message.id.as_deref() else {
+        return Ok(());
+    };
+
+    let attempt = match state.begin_attempt(message_id, Duration::from_secs(30))? {
+        AttemptStart::Started(attempt) => attempt,
+        AttemptStart::Processed => return Ok(()),
+        AttemptStart::Leased(_) => return Ok(()),
+    };
+
+    // Run application-specific logic and send any reply here.
+    state.mark_processed(&attempt)
+}
+```
+
+For multi-room catch-up, seed the poller from
+`state.snapshot().room_checkpoints().cloned()` and call
+`state.save_room_checkpoints(batch.checkpoints)` after the batch events have
+been handled successfully. If strict recovery drops a partial error batch, keep
+using the last durable snapshot and do not save that batch's checkpoint updates.
+
 ## Realtime Sidecar
 
 This crate does not implement Webex Mercury directly. For deployments that need
