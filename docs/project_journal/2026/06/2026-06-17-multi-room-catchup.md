@@ -16,7 +16,7 @@ superseded_by:
 - Added joined-room discovery configuration and `discover_joined_rooms` for the authorized generic account.
 - Added `MultiRoomMessagePoller` so services can poll every discovered joined room and receive `RoomMessage` values in deterministic chronological order.
 - Added `RoomCheckpoint` and `MessagePoller::with_seen_message_ids` so durable state can seed restart catch-up without replaying previously processed messages.
-- Per-room polling errors and refresh errors are reported without blocking catch-up for existing or later rooms in the same pass.
+- Per-room polling errors, timeouts, and refresh errors are reported without blocking catch-up for existing or later rooms in the same pass.
 
 ## Current State
 - A long-running account bot can combine the JS SDK realtime sidecar for low-latency events with multi-room REST catch-up for restart/offline recovery.

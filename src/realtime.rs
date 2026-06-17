@@ -77,6 +77,8 @@ pub struct MultiRoomPollingConfig {
     pub discovery: RoomDiscoveryConfig,
     pub room_polling: PollingConfig,
     pub room_refresh_interval: Duration,
+    /// Optional timeout for each room's polling pass. Values below 1 ms are clamped.
+    pub room_poll_timeout: Option<Duration>,
 }
 
 impl Default for MultiRoomPollingConfig {
@@ -85,6 +87,7 @@ impl Default for MultiRoomPollingConfig {
             discovery: RoomDiscoveryConfig::default(),
             room_polling: PollingConfig::default(),
             room_refresh_interval: Duration::from_secs(300),
+            room_poll_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -138,12 +141,13 @@ pub async fn discover_joined_rooms(
     let mut rooms = Vec::new();
     loop {
         rooms.extend(page.items);
-        if rooms.len() > limit {
+        let next = page.next.take();
+        if rooms.len() > limit || (rooms.len() == limit && next.is_some()) {
             return Err(Error::Other(format!(
                 "joined-room discovery exceeded max_rooms={limit}; narrow discovery or raise the limit"
             )));
         }
-        let Some(next) = page.next.take() else {
+        let Some(next) = next else {
             break;
         };
         page = client.next_page::<Room>(next).await?;
@@ -451,6 +455,7 @@ impl MultiRoomMessagePoller {
     }
 
     pub async fn refresh_rooms(&mut self) -> Result<Vec<Room>> {
+        self.last_room_discovery = Some(Instant::now());
         let discovered = discover_joined_rooms(&self.client, &self.config.discovery).await?;
         let mut next_rooms = BTreeMap::new();
         for room in discovered.iter().cloned() {
@@ -471,7 +476,6 @@ impl MultiRoomMessagePoller {
         }
         self.rooms = next_rooms;
         self.rooms_initialized = true;
-        self.last_room_discovery = Some(Instant::now());
         Ok(discovered)
     }
 
@@ -497,7 +501,7 @@ impl MultiRoomMessagePoller {
 
         let mut messages = Vec::new();
         for (room_id, entry) in self.rooms.iter_mut() {
-            match entry.poller.poll_once().await {
+            match poll_room_once(&mut entry.poller, self.config.room_poll_timeout).await {
                 Ok(room_messages) => {
                     for message in room_messages {
                         messages.push(RoomMessage {
@@ -556,6 +560,22 @@ impl MultiRoomMessagePoller {
     }
 }
 
+async fn poll_room_once(
+    poller: &mut MessagePoller,
+    timeout: Option<Duration>,
+) -> Result<Vec<ListMessage>> {
+    let Some(timeout) = timeout else {
+        return poller.poll_once().await;
+    };
+    match time::timeout(effective_poll_interval(timeout), poller.poll_once()).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Other(format!(
+            "room poll timed out after {:?}",
+            effective_poll_interval(timeout)
+        ))),
+    }
+}
+
 fn compare_room_messages(left: &RoomMessage, right: &RoomMessage) -> Ordering {
     left.message
         .created
@@ -568,7 +588,7 @@ fn compare_room_messages(left: &RoomMessage, right: &RoomMessage) -> Ordering {
 mod tests {
     use std::{
         collections::{HashSet, VecDeque},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use tokio::{
@@ -760,6 +780,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_joined_rooms_rejects_exact_limit_with_next_page() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-1"}]}"#).with_header(
+                "Link",
+                r#"<http://127.0.0.1:1/v1/rooms?page=2>; rel="next""#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+
+        let error = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("joined-room discovery exceeded max_rooms=1")
+        );
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn discover_joined_rooms_rejects_room_count_over_limit() {
         let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
             r#"{"items":[{"id":"room-1"},{"id":"room-2"}]}"#,
@@ -851,6 +900,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_room_poller_times_out_hung_room_poll() {
+        let (base_url, _requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::delay_json(
+                Duration::from_secs(60),
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_poll_timeout: Some(Duration::from_millis(1)),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        let events = poller.poll_once().await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        match error {
+            Error::RoomPoll { room_id, source } => {
+                assert_eq!(room_id, "room-a");
+                assert!(source.to_string().contains("room poll timed out"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn multi_room_poller_reports_room_error_without_dropping_other_rooms() {
         let (base_url, requests) = spawn_sequence_server(vec![
             MockResponse::json(
@@ -903,6 +983,69 @@ mod tests {
         assert!(requests[1].contains("roomId=room-a"));
         assert!(requests[2].contains("roomId=room-b"));
         assert!(requests[3].contains("roomId=room-c"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_refresh_failure_is_throttled_by_refresh_interval() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::status_json(
+                "503 Service Unavailable",
+                r#"{"message":"room discovery unavailable"}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-next","roomId":"room-a","text":"A next","created":"2026-06-17T00:00:02Z"},{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::from_secs(60),
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        poller.refresh_rooms().await.unwrap();
+        poller.last_room_discovery = Some(Instant::now() - Duration::from_secs(120));
+
+        let first_events = poller.poll_once().await.unwrap();
+        let second_events = poller.poll_once().await.unwrap();
+
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter_map(|event| event.as_ref().err())
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-next"]
+        );
+        assert!(second_events.iter().all(Result::is_ok));
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
+        assert!(requests[1].starts_with("GET /v1/rooms?"));
+        assert!(requests[2].contains("roomId=room-a"));
+        assert!(requests[3].contains("roomId=room-a"));
     }
 
     #[tokio::test]
@@ -967,6 +1110,8 @@ mod tests {
 
     struct MockResponse {
         status: &'static str,
+        headers: Vec<(&'static str, String)>,
+        delay: Option<Duration>,
         body: String,
     }
 
@@ -978,8 +1123,22 @@ mod tests {
         fn status_json(status: &'static str, body: impl Into<String>) -> Self {
             Self {
                 status,
+                headers: Vec::new(),
+                delay: None,
                 body: body.into(),
             }
+        }
+
+        fn delay_json(delay: Duration, body: impl Into<String>) -> Self {
+            Self {
+                delay: Some(delay),
+                ..Self::json(body)
+            }
+        }
+
+        fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+            self.headers.push((name, value.into()));
+            self
         }
     }
 
@@ -993,9 +1152,17 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut stream).await;
                 requests.push(String::from_utf8_lossy(&request).into_owned());
+                if let Some(delay) = response.delay {
+                    tokio::time::sleep(delay).await;
+                }
+                let mut headers = String::new();
+                for (name, value) in response.headers {
+                    headers.push_str(&format!("{name}: {value}\r\n"));
+                }
                 let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response.status,
+                    headers,
                     response.body.len(),
                     response.body
                 );
