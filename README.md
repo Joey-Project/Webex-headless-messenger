@@ -36,6 +36,13 @@ Implemented in the first slice:
 - Optional webhook HMAC-SHA1 signature verification behind the `webhooks`
   feature.
 
+Compatibility note:
+
+- `0.2.0` is a pre-1.0 breaking release. It extends polling configuration,
+  marks the public `Error` enum as non-exhaustive, and adds structured
+  multi-room polling errors. Prefer `..Default::default()` for public config
+  struct literals and keep wildcard arms when matching `Error`.
+
 Not implemented yet:
 
 - Adaptive Card builders beyond raw JSON attachment payloads.
@@ -290,11 +297,12 @@ direct JSON/JSONL persistence. Newly discovered rooms without checkpoints only
 establish a baseline on their first poll. Direct `poll_once` calls, `spawn`,
 and `spawn_batches` return per-room events plus `RoomCheckpoint` updates for
 durable state. Per-room failures without active pending backlog are emitted as
-recoverable errors so other rooms can continue; callers that require strict
-global chronological recovery can pause checkpoint persistence until retryable
-errors clear. When an active room still has pending backlog, successful messages
-are held until the backlog drains to preserve chronological catch-up order.
-`MultiRoomMessagePoller` bounds discovery
+recoverable errors so other rooms can continue. Callers that require strict
+global chronological recovery should treat any batch-level error as a retry
+boundary and avoid handling successful events or checkpoints from that batch
+until the failed room can be retried. When an active room still has pending
+backlog, successful messages are held until the backlog drains to preserve
+chronological catch-up order. `MultiRoomMessagePoller` bounds discovery
 and room polling with `room_discovery_timeout`, `room_poll_timeout`,
 `max_concurrent_room_polls`, and `max_inactive_rooms` by default. Inactive rooms
 with pending backlog are retained above the inactive limit until they reappear
