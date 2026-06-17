@@ -286,9 +286,9 @@ For generic-account services that must recover gaps across every joined space,
 use `discover_joined_rooms` or `MultiRoomMessagePoller`. Seed
 `RoomCheckpoint` with newest-first message IDs from durable state for rooms that
 were processed before restart; newly discovered rooms without checkpoints only
-establish a baseline on their first poll. Direct `poll_once` calls and
-`spawn_batches` return per-room events plus `RoomCheckpoint` updates for durable
-state, so one failing room does not block catch-up for other rooms.
+establish a baseline on their first poll. Direct `poll_once` calls, `spawn`,
+and `spawn_batches` return per-room events plus `RoomCheckpoint` updates for
+durable state, so one failing room does not block catch-up for other rooms.
 `MultiRoomMessagePoller` bounds discovery and room polling with
 `room_discovery_timeout`,
 `room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by
@@ -318,11 +318,12 @@ async fn main() -> webex_headless_messenger::Result<()> {
             "room-id-from-store",
             ["newest-seen-message-id"],
         )])
-        .spawn_batches();
+        .spawn();
 
     while let Some(batch) = batches.recv().await {
         let batch = batch?;
         for checkpoint in batch.checkpoints {
+            // Persist this checkpoint in durable state after handling the batch.
             eprintln!("checkpoint {} {:?}", checkpoint.room_id, checkpoint.seen_message_ids);
         }
         for event in batch.events {

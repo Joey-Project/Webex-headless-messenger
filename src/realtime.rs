@@ -540,14 +540,12 @@ impl MessagePoller {
         }
         let mut seen = self.seen.clone();
         seen.remember_newest_first(update.seen_ids.clone(), self.config.max_seen_ids);
-        if seen.order.is_empty() {
-            Some(RoomCheckpoint::known_empty(room_id.to_owned()))
-        } else {
-            Some(RoomCheckpoint::new(
-                room_id.to_owned(),
-                seen.order.iter().cloned(),
-            ))
-        }
+        Some(checkpoint_from_seen(room_id, &seen))
+    }
+
+    fn current_checkpoint(&self, room_id: &str) -> Option<RoomCheckpoint> {
+        self.initialized
+            .then(|| checkpoint_from_seen(room_id, &self.seen))
     }
 
     fn apply_update(&mut self, update: MessagePollUpdate) {
@@ -698,16 +696,21 @@ impl MultiRoomMessagePoller {
             }
         }
         for (room_id, entry) in std::mem::take(&mut self.rooms) {
-            remember_inactive_room(
-                &mut next_inactive_rooms,
-                &mut next_inactive_room_order,
-                room_id,
-                entry,
-            );
+            if entry.poller.has_pending_backlog() {
+                next_rooms.insert(room_id, entry);
+            } else {
+                remember_inactive_room(
+                    &mut next_inactive_rooms,
+                    &mut next_inactive_room_order,
+                    room_id,
+                    entry,
+                );
+            }
         }
         prune_inactive_rooms(
             &mut next_inactive_rooms,
             &mut next_inactive_room_order,
+            &mut self.checkpoints,
             self.config.max_inactive_rooms,
         );
         self.rooms = next_rooms;
@@ -871,8 +874,15 @@ impl MultiRoomMessagePoller {
 
     /// Spawn a background multi-room poll loop that yields full poll batches.
     ///
-    /// Prefer this over [`Self::spawn`] when the caller needs to persist
+    /// The receiver yields per-poll batches with both room events and
     /// [`RoomCheckpoint`] updates for durable catch-up.
+    pub fn spawn(self) -> mpsc::Receiver<Result<MultiRoomPoll>> {
+        self.spawn_batches()
+    }
+
+    /// Spawn a background multi-room poll loop that yields full poll batches.
+    ///
+    /// This is an explicit alias for [`Self::spawn`].
     pub fn spawn_batches(mut self) -> mpsc::Receiver<Result<MultiRoomPoll>> {
         let (sender, receiver) = mpsc::channel(256);
         tokio::spawn(async move {
@@ -900,9 +910,9 @@ impl MultiRoomMessagePoller {
     /// Spawn a background multi-room poll loop that yields only room messages.
     ///
     /// The receiver yields room messages and recoverable refresh/per-room errors.
-    /// Use [`Self::spawn_batches`] or direct [`Self::poll_once`] calls when
-    /// checkpoint persistence is required.
-    pub fn spawn(mut self) -> mpsc::Receiver<Result<RoomMessage>> {
+    /// Use [`Self::spawn`] or direct [`Self::poll_once`] calls when checkpoint
+    /// persistence is required.
+    pub fn spawn_messages(mut self) -> mpsc::Receiver<Result<RoomMessage>> {
         let (sender, receiver) = mpsc::channel(256);
         tokio::spawn(async move {
             let mut interval =
@@ -977,6 +987,14 @@ enum RoomPollResult {
     TimedOut(Duration),
 }
 
+fn checkpoint_from_seen(room_id: &str, seen: &SeenMessageIds) -> RoomCheckpoint {
+    if seen.order.is_empty() {
+        RoomCheckpoint::known_empty(room_id.to_owned())
+    } else {
+        RoomCheckpoint::new(room_id.to_owned(), seen.order.iter().cloned())
+    }
+}
+
 fn remember_inactive_room(
     inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
     inactive_room_order: &mut VecDeque<String>,
@@ -991,6 +1009,7 @@ fn remember_inactive_room(
 fn prune_inactive_rooms(
     inactive_rooms: &mut BTreeMap<String, RoomPollerEntry>,
     inactive_room_order: &mut VecDeque<String>,
+    checkpoints: &mut BTreeMap<String, (Vec<String>, bool)>,
     max_inactive_rooms: usize,
 ) {
     let limit = max_inactive_rooms.max(1);
@@ -1013,7 +1032,14 @@ fn prune_inactive_rooms(
             break;
         };
         inactive_room_order.retain(|inactive_room_id| inactive_room_id != &room_id);
-        inactive_rooms.remove(&room_id);
+        if let Some(entry) = inactive_rooms.remove(&room_id) {
+            if let Some(checkpoint) = entry.poller.current_checkpoint(&room_id) {
+                checkpoints.insert(
+                    room_id,
+                    (checkpoint.seen_message_ids, checkpoint.initialize_empty),
+                );
+            }
+        }
     }
 }
 
@@ -1281,7 +1307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_room_poller_spawn_batches_yields_checkpoint_updates() {
+    async fn multi_room_poller_spawn_yields_checkpoint_updates() {
         let (base_url, requests) = spawn_sequence_server(vec![
             MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
             MockResponse::json(
@@ -1297,7 +1323,7 @@ mod tests {
                 },
                 ..MultiRoomPollingConfig::default()
             })
-            .spawn_batches();
+            .spawn();
 
         let batch = time::timeout(Duration::from_secs(1), batches.recv())
             .await
@@ -1608,13 +1634,7 @@ mod tests {
                 ),
                 MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
                 MockResponse::json(
-                    r#"{"items":[{"id":"room-a","title":"Room A"},{"id":"room-b","title":"Room B"}]}"#,
-                ),
-                MockResponse::json(
                     r#"{"items":[{"id":"a-older","roomId":"room-a","text":"A older","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
-                ),
-                MockResponse::json(
-                    r#"{"items":[{"id":"b-later","roomId":"room-b","text":"B later","created":"2026-06-17T00:00:04Z"},{"id":"b-seen","roomId":"room-b","text":"B seen","created":"2026-06-17T00:00:00Z"}]}"#,
                 ),
             ]
         })
@@ -1638,7 +1658,6 @@ mod tests {
 
         let first_events = poller.poll_once().await.unwrap().events;
         let second_events = poller.poll_once().await.unwrap().events;
-        let third_events = poller.poll_once().await.unwrap().events;
 
         assert!(first_events.is_empty());
         assert_eq!(
@@ -1647,23 +1666,35 @@ mod tests {
                 .filter_map(|event| event.as_ref().ok())
                 .map(|message| message.message.id.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["b-later"]
-        );
-        assert_eq!(
-            third_events
-                .iter()
-                .filter_map(|event| event.as_ref().ok())
-                .map(|message| message.message.id.as_deref().unwrap())
-                .collect::<Vec<_>>(),
-            ["a-older", "a-newer"]
+            ["a-older", "a-newer", "b-later"]
         );
 
         let requests = requests.await.unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 5);
         assert!(requests[3].starts_with("GET /v1/rooms?"));
-        assert!(requests[4].starts_with("GET /v1/rooms?"));
-        assert!(requests[5].starts_with("GET /v1/messages?page=2"));
-        assert!(requests[6].contains("roomId=room-b"));
+        assert!(requests[4].starts_with("GET /v1/messages?page=2"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_empty_checkpoint_establishes_baseline() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-existing","roomId":"room-a","text":"A existing","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", Vec::<String>::new())]);
+
+        let batch = poller.poll_once().await.unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.checkpoints.len(), 1);
+        assert_eq!(batch.checkpoints[0].room_id, "room-a");
+        assert_eq!(batch.checkpoints[0].seen_message_ids, ["a-existing"]);
+        assert_eq!(requests.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1696,6 +1727,50 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 3);
     }
 
+    #[tokio::test]
+    async fn multi_room_poller_reuses_checkpoint_after_pruning_inactive_room_state() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+            MockResponse::json(r#"{"items":[{"id":"room-b","title":"Room B"}]}"#),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-c","title":"Room C"}]}"#),
+            MockResponse::json(r#"{"items":[]}"#),
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-new","roomId":"room-a","text":"A new","created":"2026-06-17T00:00:01Z"},{"id":"a-seen","roomId":"room-a","text":"A seen","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let client = client_for(base_url);
+        let mut poller = MultiRoomMessagePoller::new(client)
+            .with_config(MultiRoomPollingConfig {
+                room_refresh_interval: Duration::ZERO,
+                max_inactive_rooms: 1,
+                ..MultiRoomPollingConfig::default()
+            })
+            .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
+
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.poll_once().await.unwrap().events.is_empty());
+        assert!(poller.checkpoints.contains_key("room-a"));
+
+        let events = poller.poll_once().await.unwrap().events;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .map(|message| message.message.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(requests.await.unwrap().len(), 8);
+    }
+
     #[test]
     fn prune_inactive_rooms_retains_pending_backlog_states() {
         let mut pending_poller = MessagePoller::new(dummy_client(), "room-a");
@@ -1723,12 +1798,20 @@ mod tests {
             },
         );
         let mut inactive_room_order = VecDeque::from(["room-a".to_owned(), "room-b".to_owned()]);
+        let mut checkpoints = BTreeMap::new();
 
-        prune_inactive_rooms(&mut inactive_rooms, &mut inactive_room_order, 1);
+        prune_inactive_rooms(
+            &mut inactive_rooms,
+            &mut inactive_room_order,
+            &mut checkpoints,
+            1,
+        );
 
         assert!(inactive_rooms.contains_key("room-a"));
         assert!(!inactive_rooms.contains_key("room-b"));
         assert_eq!(inactive_room_order, VecDeque::from(["room-a".to_owned()]));
+        assert!(!checkpoints.contains_key("room-a"));
+        assert_eq!(checkpoints.get("room-b"), Some(&(Vec::new(), true)));
     }
 
     #[tokio::test]
