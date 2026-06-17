@@ -145,8 +145,20 @@ pub async fn discover_joined_rooms(
     let limit = config.max_rooms.max(1);
     let mut page = first;
     let mut rooms = Vec::new();
+    let mut room_indexes = BTreeMap::new();
     loop {
-        rooms.extend(page.items);
+        for room in page.items {
+            if let Some(room_id) = room.id.clone() {
+                if let Some(index) = room_indexes.get(&room_id).copied() {
+                    rooms[index] = room;
+                } else {
+                    room_indexes.insert(room_id, rooms.len());
+                    rooms.push(room);
+                }
+            } else {
+                rooms.push(room);
+            }
+        }
         let next = page.next.take();
         if rooms.len() > limit || (rooms.len() == limit && next.is_some()) {
             return Err(Error::Other(format!(
@@ -236,6 +248,17 @@ fn preserve_pending_on_page_error(initialized: bool, emit_existing_on_first_poll
 
 fn effective_poll_interval(interval: Duration) -> Duration {
     interval.max(Duration::from_millis(1))
+}
+
+async fn poll_tick_or_receiver_open<T>(
+    sender: &mpsc::Sender<T>,
+    interval: &mut time::Interval,
+) -> bool {
+    if sender.is_closed() {
+        return false;
+    }
+    interval.tick().await;
+    !sender.is_closed()
 }
 
 fn ensure_pending_within_limit(
@@ -391,7 +414,12 @@ impl MessagePoller {
         tokio::spawn(async move {
             let mut interval = time::interval(effective_poll_interval(self.config.interval));
             loop {
-                interval.tick().await;
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
                 match self.poll_once().await {
                     Ok(messages) => {
                         for message in messages {
@@ -616,7 +644,12 @@ impl MultiRoomMessagePoller {
             let mut interval =
                 time::interval(effective_poll_interval(self.config.room_polling.interval));
             loop {
-                interval.tick().await;
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
                 match self.poll_once().await {
                     Ok(events) => {
                         for event in events {
@@ -709,7 +742,9 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::mpsc,
         task::JoinHandle,
+        time,
     };
     use url::Url;
 
@@ -719,7 +754,7 @@ mod tests {
         MessagePoller, MultiRoomMessagePoller, MultiRoomPollingConfig, PollingConfig,
         RoomCheckpoint, RoomDiscoveryConfig, SeenMessageIds, collect_page_messages,
         discover_joined_rooms, effective_poll_interval, ensure_pending_within_limit,
-        preserve_pending_on_page_error,
+        poll_tick_or_receiver_open, preserve_pending_on_page_error,
     };
 
     #[test]
@@ -841,6 +876,15 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn poll_tick_stops_when_receiver_is_closed() {
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        let mut interval = time::interval(Duration::from_secs(60));
+        drop(receiver);
+
+        assert!(!poll_tick_or_receiver_open(&sender, &mut interval).await);
+    }
+
     #[test]
     fn pending_backlog_limit_is_enforced() {
         assert!(ensure_pending_within_limit(2, 2, 2).is_ok());
@@ -920,6 +964,30 @@ mod tests {
                 .to_string()
                 .contains("joined-room discovery exceeded max_rooms=1")
         );
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discover_joined_rooms_deduplicates_before_max_room_limit() {
+        let (base_url, requests) = spawn_sequence_server(vec![MockResponse::json(
+            r#"{"items":[{"id":"room-1","title":"Room 1"},{"id":"room-1","title":"Room 1 Updated"}]}"#,
+        )])
+        .await;
+        let client = client_for(base_url);
+
+        let rooms = discover_joined_rooms(
+            &client,
+            &RoomDiscoveryConfig {
+                max_rooms: 1,
+                ..RoomDiscoveryConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id.as_deref(), Some("room-1"));
+        assert_eq!(rooms[0].title.as_deref(), Some("Room 1 Updated"));
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
@@ -1317,7 +1385,9 @@ mod tests {
             })
             .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
 
+        poller.config.room_discovery_timeout = None;
         poller.refresh_rooms().await.unwrap();
+        poller.config.room_discovery_timeout = Some(Duration::from_millis(1));
         let events = poller.poll_once().await.unwrap();
 
         assert_eq!(
@@ -1389,7 +1459,9 @@ mod tests {
             })
             .with_room_checkpoints([RoomCheckpoint::new("room-a", ["a-seen"])]);
 
+        poller.config.room_discovery_timeout = None;
         poller.refresh_rooms().await.unwrap();
+        poller.config.room_discovery_timeout = Some(Duration::from_millis(1));
         poller.last_room_discovery = Some(Instant::now() - Duration::from_secs(1));
 
         let first_events = poller.poll_once().await.unwrap();
