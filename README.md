@@ -286,10 +286,11 @@ For generic-account services that must recover gaps across every joined space,
 use `discover_joined_rooms` or `MultiRoomMessagePoller`. Seed
 `RoomCheckpoint` with newest-first message IDs from durable state for rooms that
 were processed before restart; newly discovered rooms without checkpoints only
-establish a baseline on their first poll. Direct `poll_once` calls return a
-batch with per-room events plus `RoomCheckpoint` updates for durable state, so
-one failing room does not block catch-up for other rooms. `MultiRoomMessagePoller`
-bounds discovery and room polling with `room_discovery_timeout`,
+establish a baseline on their first poll. Direct `poll_once` calls and
+`spawn_batches` return per-room events plus `RoomCheckpoint` updates for durable
+state, so one failing room does not block catch-up for other rooms.
+`MultiRoomMessagePoller` bounds discovery and room polling with
+`room_discovery_timeout`,
 `room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by
 default. Inactive rooms with pending backlog are retained above the inactive
 limit until they reappear and drain, but they do not block delivery for
@@ -305,7 +306,7 @@ use webex_headless_messenger::{
 #[tokio::main]
 async fn main() -> webex_headless_messenger::Result<()> {
     let client = WebexClient::from_access_token(std::env::var("WEBEX_ACCESS_TOKEN").unwrap())?;
-    let mut events = MultiRoomMessagePoller::new(client)
+    let mut batches = MultiRoomMessagePoller::new(client)
         .with_config(MultiRoomPollingConfig {
             room_polling: PollingConfig {
                 interval: Duration::from_secs(10),
@@ -317,15 +318,21 @@ async fn main() -> webex_headless_messenger::Result<()> {
             "room-id-from-store",
             ["newest-seen-message-id"],
         )])
-        .spawn();
+        .spawn_batches();
 
-    while let Some(event) = events.recv().await {
-        match event {
-            Ok(room_message) => {
-                println!("{} {:?}", room_message.room_id, room_message.message.text);
-            }
-            Err(error) => {
-                eprintln!("recoverable multi-room poll error: {error}");
+    while let Some(batch) = batches.recv().await {
+        let batch = batch?;
+        for checkpoint in batch.checkpoints {
+            eprintln!("checkpoint {} {:?}", checkpoint.room_id, checkpoint.seen_message_ids);
+        }
+        for event in batch.events {
+            match event {
+                Ok(room_message) => {
+                    println!("{} {:?}", room_message.room_id, room_message.message.text);
+                }
+                Err(error) => {
+                    eprintln!("recoverable multi-room poll error: {error}");
+                }
             }
         }
     }

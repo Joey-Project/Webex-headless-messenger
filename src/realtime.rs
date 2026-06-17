@@ -869,10 +869,39 @@ impl MultiRoomMessagePoller {
             .unwrap_or(false)
     }
 
-    /// Spawn a background multi-room poll loop.
+    /// Spawn a background multi-room poll loop that yields full poll batches.
     ///
-    /// The receiver yields both room messages and recoverable refresh/per-room
-    /// errors. A failed room does not stop polling other rooms.
+    /// Prefer this over [`Self::spawn`] when the caller needs to persist
+    /// [`RoomCheckpoint`] updates for durable catch-up.
+    pub fn spawn_batches(mut self) -> mpsc::Receiver<Result<MultiRoomPoll>> {
+        let (sender, receiver) = mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut interval =
+                time::interval(effective_poll_interval(self.config.room_polling.interval));
+            loop {
+                if !poll_tick_or_receiver_open(&sender, &mut interval).await {
+                    return;
+                }
+                if sender.is_closed() {
+                    return;
+                }
+                let result = tokio::select! {
+                    _ = sender.closed() => return,
+                    result = self.poll_once() => result,
+                };
+                if sender.send(result).await.is_err() {
+                    return;
+                }
+            }
+        });
+        receiver
+    }
+
+    /// Spawn a background multi-room poll loop that yields only room messages.
+    ///
+    /// The receiver yields room messages and recoverable refresh/per-room errors.
+    /// Use [`Self::spawn_batches`] or direct [`Self::poll_once`] calls when
+    /// checkpoint persistence is required.
     pub fn spawn(mut self) -> mpsc::Receiver<Result<RoomMessage>> {
         let (sender, receiver) = mpsc::channel(256);
         tokio::spawn(async move {
@@ -1248,6 +1277,43 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v1/rooms?"));
         assert!(requests[1].starts_with("GET /v1/messages?"));
+        assert!(requests[1].contains("roomId=room-a"));
+    }
+
+    #[tokio::test]
+    async fn multi_room_poller_spawn_batches_yields_checkpoint_updates() {
+        let (base_url, requests) = spawn_sequence_server(vec![
+            MockResponse::json(r#"{"items":[{"id":"room-a","title":"Room A"}]}"#),
+            MockResponse::json(
+                r#"{"items":[{"id":"a-existing","roomId":"room-a","text":"A existing","created":"2026-06-17T00:00:00Z"}]}"#,
+            ),
+        ])
+        .await;
+        let mut batches = MultiRoomMessagePoller::new(client_for(base_url))
+            .with_config(MultiRoomPollingConfig {
+                room_polling: PollingConfig {
+                    interval: Duration::from_millis(1),
+                    ..PollingConfig::default()
+                },
+                ..MultiRoomPollingConfig::default()
+            })
+            .spawn_batches();
+
+        let batch = time::timeout(Duration::from_secs(1), batches.recv())
+            .await
+            .expect("spawned batch was not received")
+            .expect("spawned batch channel closed")
+            .unwrap();
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.checkpoints.len(), 1);
+        assert_eq!(batch.checkpoints[0].room_id, "room-a");
+        assert_eq!(batch.checkpoints[0].seen_message_ids, ["a-existing"]);
+
+        drop(batches);
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/rooms?"));
         assert!(requests[1].contains("roomId=room-a"));
     }
 
