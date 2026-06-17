@@ -286,8 +286,12 @@ For generic-account services that must recover gaps across every joined space,
 use `discover_joined_rooms` or `MultiRoomMessagePoller`. Seed
 `RoomCheckpoint` with newest-first message IDs from durable state for rooms that
 were processed before restart; newly discovered rooms without checkpoints only
-establish a baseline on their first poll. Direct `poll_once` calls return
-per-room results so one failing room does not block catch-up for other rooms. `MultiRoomMessagePoller` bounds discovery and room polling with `room_discovery_timeout`, `room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by default.
+establish a baseline on their first poll. Direct `poll_once` calls return a
+batch with per-room events plus `RoomCheckpoint` updates for durable state, so
+one failing room does not block catch-up for other rooms. `MultiRoomMessagePoller`
+bounds discovery and room polling with `room_discovery_timeout`,
+`room_poll_timeout`, `max_concurrent_room_polls`, and `max_inactive_rooms` by
+default.
 
 ```rust
 use std::time::Duration;

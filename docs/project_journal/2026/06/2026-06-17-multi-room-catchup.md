@@ -16,6 +16,7 @@ superseded_by:
 - Added joined-room discovery configuration and `discover_joined_rooms` for the authorized generic account.
 - Added `MultiRoomMessagePoller` so services can poll every discovered joined room and receive `RoomMessage` values in deterministic chronological order.
 - Added `RoomCheckpoint` and `MessagePoller::with_seen_message_ids` so durable state can seed restart catch-up without replaying previously processed messages.
+- `MultiRoomMessagePoller::poll_once` returns a batch with recoverable room events and committed checkpoint updates for the next JSONL store PR.
 - Discovery refreshes and per-room polls are bounded by timeouts, and room polls run with bounded concurrency so slow rooms do not starve later healthy rooms.
 
 ## Current State
