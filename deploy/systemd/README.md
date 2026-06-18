@@ -202,7 +202,9 @@ journalctl -u webex-headless-token-refresh.service
   `--access-token-file-group-readable` only with the dedicated
   `webex-headless-sidecar` group and setgid access-token directory.
 - Keep `WEBEX_REFRESH_TOKEN_FILE` private to the token-refresh env file; it stores
-  the full refreshable `TokenSet` cache.
+  the full refreshable `TokenSet` cache. The token-refresh timer is shared
+  infrastructure for both stacks: keep it independently enabled instead of
+  tying its lifecycle to only one receiver or bot target.
 - Keep `WEBEX_CLIENT_SECRET_FILE` private to the token-refresh env file, and keep
   the referenced secret file readable only by root and `webex-headless-token`;
   the parent directory must also be traversable by `webex-headless-token`.
