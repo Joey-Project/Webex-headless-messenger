@@ -13,6 +13,7 @@ User=webex-headless-sidecar
 Group=webex-headless-sidecar
 WorkingDirectory=/opt/webex-headless-messenger/examples/sidecar-js
 EnvironmentFile=/etc/webex-headless/webex-headless.env
+Environment=WEBEX_SIDECAR_MESSAGE_EVENTS=created
 ExecStartPre=/usr/bin/env WEBEX_SIDECAR_VALIDATE_CONFIG=1 /usr/bin/node /opt/webex-headless-messenger/examples/sidecar-js/index.mjs
 ExecStart=/usr/bin/node /opt/webex-headless-messenger/examples/sidecar-js/index.mjs
 Restart=on-failure
