@@ -216,9 +216,10 @@ journalctl -u webex-headless-token-refresh.service
 - The JS sidecar exits when forwarding retries are exhausted. Systemd restarts
   it; the bot must still use REST catch-up and message ID de-duplication to fill
   restart gaps.
-- The account-bot sidecar unit overrides `WEBEX_SIDECAR_MESSAGE_EVENTS=created`
-  after loading the shared JS sidecar env file because the account bot only
-  handles new-message events.
+- The account-bot sidecar unit invokes the JS process through `/usr/bin/env
+  WEBEX_SIDECAR_MESSAGE_EVENTS=created` because systemd `EnvironmentFile=`
+  values override `Environment=` assignments and the account bot only handles
+  new-message events.
 - The account-bot stack is intentionally thin: no rule DSL or handler registry
   is baked into these units. Keep app-specific rule dispatch in the downstream
   bot service until a reusable shape is clear.
