@@ -17,9 +17,10 @@ The sidecar pieces are:
   events.
 - `webex-headless sidecar receive`: loopback HTTP receiver that emits accepted
   `SidecarEvent` envelopes as JSON Lines and exposes a local health endpoint.
-- `examples/account_bot.rs`: small long-running generic-account bot demo that
-  accepts the same sidecar HTTP events, filters self messages, stores processed
-  message IDs, and replies through the REST client.
+- `webex-account-bot` / `examples/account_bot.rs`: small long-running
+  generic-account bot demo that accepts the same sidecar HTTP events, filters
+  self messages, stores processed message IDs, and replies through the REST
+  client.
 - `examples/sidecar_receiver.rs`: smaller receiver example kept for embedding
   and mock protocol tests.
 
@@ -72,24 +73,25 @@ stderr line like `sidecar_event_accepted_from=127.0.0.1:...`.
 
 ## Account Bot Mock E2E
 
-Use `examples/account_bot.rs` when you want a concrete Rust process instead of
-the JSONL receiver. In mock mode it does not call Webex; it validates the local
+Use the `webex-account-bot` binary when you want a concrete Rust process instead
+of the JSONL receiver; the source remains in `examples/account_bot.rs` for
+embedding and tests. In mock mode it does not call Webex; it validates the local
 sidecar HTTP protocol, bearer token, room filtering, self-message filtering when
 `WEBEX_ACCOUNT_BOT_SELF_PERSON_ID` matches the mock `personId`, and
-processed-message ID state file. It also keeps the local HTTP listener responsive by handling
-connections concurrently with a bounded request count and per-request handler
-timeout. In live mode, the bot verifies state persistence at startup, records a
-bounded attempt lease before sending the REST reply, and marks the message ID
-processed only after Webex accepts the reply. This keeps ordinary Webex/API
-failures retryable while avoiding immediate duplicate replies after a timeout or
-restart. If the connection to Webex is lost or the response cannot be decoded
-after the `create_message` request was sent, the bot records an at-most-once
-`reply_unknown` result instead of risking duplicate replies; explicit Webex API
-401/408/429/5xx responses remain retryable, with upstream 401 token races mapped
-back to receiver HTTP 503 so the sidecar can retry after token refresh. If Webex
-accepts a reply but the state write fails, the bot returns a
-retryable 503 with `Retry-After`, keeps same-process de-duplication in memory,
-and reports degraded health.
+processed-message ID state file. It also keeps the local HTTP listener
+responsive by handling connections concurrently with a bounded request count and
+per-request handler timeout. In live mode, the bot verifies state persistence at
+startup, records a bounded attempt lease before sending the REST reply, and marks
+the message ID processed only after Webex accepts the reply. This keeps ordinary
+Webex/API failures retryable while avoiding immediate duplicate replies after a
+timeout or restart. If the connection to Webex is lost or the response cannot be
+decoded after the `create_message` request was sent, the bot records an
+at-most-once `reply_unknown` result instead of risking duplicate replies;
+explicit Webex API 401/408/429/5xx responses remain retryable, with upstream 401
+token races mapped back to receiver HTTP 503 so the sidecar can retry after
+token refresh. If Webex accepts a reply but the state write fails, the bot
+returns a retryable 503 with `Retry-After`, keeps same-process de-duplication in
+memory, and reports degraded health.
 
 Terminal 1:
 
@@ -99,7 +101,7 @@ WEBEX_ACCOUNT_BOT_BIND=127.0.0.1:8787 \
 WEBEX_ACCOUNT_BOT_STATE_FILE=.codex-tmp/account-bot/processed-message-ids.txt \
 WEBEX_ACCOUNT_BOT_MAX_EVENTS=1 \
 WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
-cargo run --example account_bot --all-features
+cargo run --bin webex-account-bot --all-features
 ```
 
 Terminal 2:
@@ -257,8 +259,11 @@ curl -fsS http://127.0.0.1:8788/readyz
 curl -fsS http://127.0.0.1:8788/livez
 ```
 
-Linux systemd templates for the receiver, JS sidecar, and token refresh timer
-are available in [`deploy/systemd`](../deploy/systemd).
+Linux systemd templates for both the JSONL receiver stack and the integrated
+account-bot stack are available in [`deploy/systemd`](../deploy/systemd). Use
+`webex-headless-sidecar.target` for the receiver demo, or
+`webex-headless-account-bot.target` when the sidecar should forward directly to
+`webex-account-bot`.
 
 ## Reliability Model
 

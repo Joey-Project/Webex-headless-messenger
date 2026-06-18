@@ -1,0 +1,34 @@
+[Unit]
+Description=Webex Headless account bot
+Documentation=https://github.com/Joey-Project/Webex-headless-messenger
+After=network-online.target webex-headless-token-refresh.service
+Wants=network-online.target webex-headless-token-refresh.service
+PartOf=webex-headless-account-bot.target
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=webex-headless-account-bot
+Group=webex-headless-account-bot
+SupplementaryGroups=webex-headless-sidecar
+EnvironmentFile=/etc/webex-headless/webex-headless-account-bot.env
+ExecStart=/usr/local/bin/webex-account-bot
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=webex-headless-account-bot
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/webex-headless-account-bot
+ReadOnlyPaths=/var/lib/webex-headless-access
+InaccessiblePaths=/etc/webex-headless/webex-headless-token.env
+InaccessiblePaths=/var/lib/webex-headless-token
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=webex-headless-account-bot.target
