@@ -660,24 +660,24 @@ impl AccountBot {
         let Some(message_id) = message.id.clone() else {
             return Ok(BotAction::ignored("missing_message_id", None, None));
         };
-        let (inflight, event_slot) = loop {
-            match self.begin_in_flight_attempt(message_id.clone())? {
-                BeginInFlight::Started(inflight) => {
-                    if let Some(event_slot) = self.try_acquire_event_slot() {
-                        break (inflight, event_slot);
-                    }
+        let (inflight, event_slot) = match self.begin_in_flight_attempt(message_id.clone())? {
+            BeginInFlight::Started(inflight) => {
+                if let Some(event_slot) = self.try_acquire_event_slot() {
+                    (inflight, event_slot)
+                } else {
                     self.release_or_retry_after(inflight, &message_id, "max events reached")?;
                     return Err(Error::Other("max events reached".to_owned()).into());
                 }
-                BeginInFlight::Processed => {
-                    return self.duplicate_message_action(message_id, message.room_id.clone());
-                }
-                BeginInFlight::InProgress => {
-                    match self.wait_for_in_flight_attempt(&message_id).await? {
-                        BeginInFlight::Started(inflight) => {
-                            if let Some(event_slot) = self.try_acquire_event_slot() {
-                                break (inflight, event_slot);
-                            }
+            }
+            BeginInFlight::Processed => {
+                return self.duplicate_message_action(message_id, message.room_id.clone());
+            }
+            BeginInFlight::InProgress => {
+                match self.wait_for_in_flight_attempt(&message_id).await? {
+                    BeginInFlight::Started(inflight) => {
+                        if let Some(event_slot) = self.try_acquire_event_slot() {
+                            (inflight, event_slot)
+                        } else {
                             self.release_or_retry_after(
                                 inflight,
                                 &message_id,
@@ -685,34 +685,29 @@ impl AccountBot {
                             )?;
                             return Err(Error::Other("max events reached".to_owned()).into());
                         }
-                        BeginInFlight::Processed => {
-                            return self
-                                .duplicate_message_action(message_id, message.room_id.clone());
-                        }
-                        BeginInFlight::InProgress => {
-                            return Err(BotError::retry_after(
-                                format!(
-                                    "message {message_id} reply attempt is already in progress"
-                                ),
-                                self.config.in_flight_wait,
-                            ));
-                        }
-                        BeginInFlight::AttemptLeased(retry_after) => {
-                            return Err(BotError::retry_after(
-                                format!(
-                                    "message {message_id} reply attempt is pending retry lease"
-                                ),
-                                retry_after,
-                            ));
-                        }
+                    }
+                    BeginInFlight::Processed => {
+                        return self.duplicate_message_action(message_id, message.room_id.clone());
+                    }
+                    BeginInFlight::InProgress => {
+                        return Err(BotError::retry_after(
+                            format!("message {message_id} reply attempt is already in progress"),
+                            self.config.in_flight_wait,
+                        ));
+                    }
+                    BeginInFlight::AttemptLeased(retry_after) => {
+                        return Err(BotError::retry_after(
+                            format!("message {message_id} reply attempt is pending retry lease"),
+                            retry_after,
+                        ));
                     }
                 }
-                BeginInFlight::AttemptLeased(retry_after) => {
-                    return Err(BotError::retry_after(
-                        format!("message {message_id} reply attempt is pending retry lease"),
-                        retry_after,
-                    ));
-                }
+            }
+            BeginInFlight::AttemptLeased(retry_after) => {
+                return Err(BotError::retry_after(
+                    format!("message {message_id} reply attempt is pending retry lease"),
+                    retry_after,
+                ));
             }
         };
         if let Some(room_id) = message.room_id.clone() {
@@ -880,6 +875,7 @@ impl AccountBot {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_reply(
         &self,
         inflight: InFlightMessage,
@@ -929,14 +925,13 @@ impl AccountBot {
             });
             let _ = result_sender.send(result);
         });
-        let result = result_receiver.await.map_err(|error| {
+        result_receiver.await.map_err(|error| {
             self.state_persist_failed.store(true, Ordering::Relaxed);
             BotError::retry_after(
                 format!("message reply worker failed before completion: {error}"),
                 retry_after_for_lease(self.config.attempt_lease),
             )
-        })?;
-        result
+        })?
     }
 
     fn finish_after_known_api_failure(
@@ -1082,6 +1077,7 @@ impl AccountBot {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_reply_worker(
     client: WebexClient,
     state_persist_failed: Arc<AtomicBool>,
@@ -2085,7 +2081,7 @@ fn parse_request(headers: &[u8], body: Vec<u8>) -> Result<HttpRequest> {
 }
 
 fn parse_content_length(headers: &str) -> Result<Option<usize>> {
-    Ok(headers
+    headers
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -2096,7 +2092,7 @@ fn parse_content_length(headers: &str) -> Result<Option<usize>> {
                     .map_err(|_| Error::Other("invalid content-length".to_owned()))
             })
         })
-        .transpose()?)
+        .transpose()
 }
 
 async fn write_response(
@@ -2354,7 +2350,7 @@ fn log_action_json(action: BotAction) -> bool {
         return false;
     }
 
-    let _ = tokio::task::spawn_blocking(move || {
+    std::mem::drop(tokio::task::spawn_blocking(move || {
         let result = print_json_line(&action);
         PENDING_ACTION_LOGS.fetch_sub(1, Ordering::AcqRel);
         if let Err(error) = result {
@@ -2363,7 +2359,7 @@ fn log_action_json(action: BotAction) -> bool {
                 "account_bot_action_log_failed error={error}"
             );
         }
-    });
+    }));
     true
 }
 
@@ -3210,7 +3206,7 @@ mod tests {
 
         let first = tokio::spawn(send_event_request(address, "message-1"));
         let second = tokio::spawn(send_event_request(address, "message-2"));
-        let mut responses = vec![first.await.unwrap(), second.await.unwrap()];
+        let mut responses = [first.await.unwrap(), second.await.unwrap()];
         responses.sort();
         server.await.unwrap();
 
@@ -3430,7 +3426,7 @@ mod tests {
 
         let mut request = Vec::new();
         request.extend_from_slice(b"GET /healthz HTTP/1.1\r\nX-Fill: ");
-        request.extend(std::iter::repeat(b'a').take(MAX_HEADER_BYTES));
+        request.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES));
         request.extend_from_slice(b"\r\n\r\n");
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(&request).await.unwrap();

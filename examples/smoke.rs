@@ -235,46 +235,6 @@ fn parse_scopes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn token(scopes: &[&str]) -> TokenSet {
-        TokenSet {
-            access_token: "access-token".to_owned(),
-            refresh_token: Some("refresh-token".to_owned()),
-            token_type: "Bearer".to_owned(),
-            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-            expires_at: None,
-            refresh_token_expires_at: None,
-        }
-    }
-
-    #[test]
-    fn spark_all_token_satisfies_default_rest_scopes_when_kms_is_present() {
-        let requested = vec![
-            "spark:messages_read".to_owned(),
-            "spark:messages_write".to_owned(),
-            "spark:kms".to_owned(),
-        ];
-
-        assert!(token_has_requested_scopes(
-            &token(&["spark:all", "spark:kms"]),
-            &requested
-        ));
-    }
-
-    #[test]
-    fn cached_token_must_include_all_requested_scopes() {
-        let requested = vec!["spark:all".to_owned(), "spark:kms".to_owned()];
-
-        assert!(!token_has_requested_scopes(
-            &token(&["spark:messages_read", "spark:kms"]),
-            &requested,
-        ));
-    }
-}
-
 #[cfg(unix)]
 fn read_token_cache(path: &Path) -> webex_headless_messenger::Result<Option<String>> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -428,5 +388,45 @@ fn unquote(value: &str) -> String {
         value[1..value.len() - 1].to_owned()
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(scopes: &[&str]) -> TokenSet {
+        TokenSet {
+            access_token: "access-token".to_owned(),
+            refresh_token: Some("refresh-token".to_owned()),
+            token_type: "Bearer".to_owned(),
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            expires_at: None,
+            refresh_token_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn spark_all_token_satisfies_default_rest_scopes_when_kms_is_present() {
+        let requested = vec![
+            "spark:messages_read".to_owned(),
+            "spark:messages_write".to_owned(),
+            "spark:kms".to_owned(),
+        ];
+
+        assert!(token_has_requested_scopes(
+            &token(&["spark:all", "spark:kms"]),
+            &requested
+        ));
+    }
+
+    #[test]
+    fn cached_token_must_include_all_requested_scopes() {
+        let requested = vec!["spark:all".to_owned(), "spark:kms".to_owned()];
+
+        assert!(!token_has_requested_scopes(
+            &token(&["spark:messages_read", "spark:kms"]),
+            &requested,
+        ));
     }
 }

@@ -34,6 +34,11 @@ webhooks = ["dep:hex", "dep:hmac", "dep:sha1"]
 sqlite-state-cache = ["dep:rusqlite", "dep:rustix"]
 experimental-websocket = []
 
+[[bin]]
+name = "webex-account-bot"
+path = "src/bin/webex-account-bot.rs"
+test = true
+
 [[example]]
 name = "account_bot"
 path = "examples/account_bot.rs"

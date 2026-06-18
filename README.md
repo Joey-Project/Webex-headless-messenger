@@ -459,8 +459,9 @@ templates.
 
 ## Account Bot Example
 
-`examples/account_bot.rs` is a small long-running bot process that can replace
-the JSONL receiver in the sidecar stack. It accepts the same sidecar HTTP event
+`examples/account_bot.rs` is also packaged as the `webex-account-bot` binary
+target for long-running deployments. It can replace the JSONL receiver in the
+sidecar stack and accepts the same sidecar HTTP event
 envelope, requires the same local forwarding bearer token, filters self
 messages, optionally restricts rooms with `WEBEX_ACCOUNT_BOT_ROOM_IDS`, stores
 processed message IDs in a file, and replies to new messages with the REST
@@ -506,7 +507,7 @@ WEBEX_ACCOUNT_BOT_BIND=127.0.0.1:8787 \
 WEBEX_ACCOUNT_BOT_STATE_FILE=.codex-tmp/account-bot/processed-message-ids.txt \
 WEBEX_ACCOUNT_BOT_MAX_EVENTS=1 \
 WEBEX_SIDECAR_TOKEN=dev-sidecar-token \
-cargo run --example account_bot --all-features
+cargo run --bin webex-account-bot --all-features
 ```
 
 Terminal 2:
@@ -526,7 +527,11 @@ to `created` when forwarding to this bot; the bot intentionally handles only new
 message events. The bot reloads the access token file for each REST request, so
 token rotation by the timer is picked up without restarting the bot. Use
 `WEBEX_ACCOUNT_BOT_SELF_PERSON_ID` to avoid the startup `people/me` call when you
-already know the generic account person ID.
+already know the generic account person ID. For Linux supervisor deployments,
+`deploy/systemd/webex-headless-account-bot.target` runs the bot, JS sidecar, and
+token refresh timer together; install `webex-account-bot` next to
+`webex-headless` and use `webex-headless-account-bot.env.example` for the bot
+service-specific environment.
 
 ## Smoke Test
 

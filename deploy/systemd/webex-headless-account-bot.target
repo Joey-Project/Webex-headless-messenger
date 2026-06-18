@@ -1,0 +1,10 @@
+[Unit]
+Description=Webex Headless account bot realtime stack
+Wants=network-online.target
+Wants=webex-headless-account-bot.service
+Wants=webex-headless-account-bot-sidecar-js.service
+Wants=webex-headless-token-refresh.timer
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
