@@ -408,6 +408,21 @@ For multi-room catch-up, seed the poller from
 been handled successfully. If strict recovery drops a partial error batch, keep
 using the last durable snapshot and do not save that batch's checkpoint updates.
 
+Enable the `sqlite-state-cache` feature when a long JSONL log needs faster
+processed-message or room-checkpoint lookups. `SqliteStateCache` is a rebuildable
+index, not a second source of truth; rebuild it from the JSONL store after durable
+state changes that should be visible to indexed queries.
+
+```rust
+use webex_headless_messenger::{JsonlStateStore, SqliteStateCache};
+
+fn refresh_cache(state: &JsonlStateStore) -> webex_headless_messenger::Result<SqliteStateCache> {
+    let mut cache = SqliteStateCache::open("webex-state-cache.sqlite3")?;
+    cache.rebuild_from_store(state)?;
+    Ok(cache)
+}
+```
+
 ## Realtime Sidecar
 
 This crate does not implement Webex Mercury directly. For deployments that need
