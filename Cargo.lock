@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "webex-headless-messenger"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",

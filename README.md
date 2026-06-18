@@ -38,10 +38,10 @@ Implemented in the first slice:
 
 Compatibility note:
 
-- `0.2.0` is a pre-1.0 breaking release. It extends polling configuration,
-  marks the public `Error` enum as non-exhaustive, and adds structured
-  multi-room polling errors. Prefer `..Default::default()` for public config
-  struct literals and keep wildcard arms when matching `Error`.
+- `0.1.0` is the first public pre-1.0 release. Public APIs may still change
+  while the production bot integration shape settles. Prefer
+  `..Default::default()` for public config struct literals and keep wildcard
+  arms when matching the non-exhaustive `Error` enum.
 
 Not implemented yet:
 
@@ -89,6 +89,25 @@ that endpoint.
 
 Authorization Code helpers include PKCE support through
 `authorization_url_with_pkce` and `exchange_authorization_code_with_pkce`.
+
+## Install
+
+Use the library from crates.io:
+
+```bash
+cargo add webex-headless-messenger
+```
+
+Install the operator binaries when you want the OAuth/REST CLI or the thin
+account-bot process:
+
+```bash
+cargo install webex-headless-messenger --locked
+```
+
+`webex-headless` is the OAuth and REST operator CLI. `webex-account-bot` is a
+small sidecar receiver bot intended as an integration template for downstream
+automation services.
 
 ## Quick Start
 
@@ -533,6 +552,25 @@ token refresh timer together; install `webex-account-bot` next to
 `webex-headless` and use `webex-headless-account-bot.env.example` for the bot
 service-specific environment.
 
+## Production Bot Integration
+
+For a long-running generic-account bot, keep this crate as the Webex support
+layer and put application-specific rules in the downstream bot repository:
+
+- Authorize the generic account with a Webex OAuth Integration and keep the
+  refreshable token cache private to the token-refresh process.
+- Use `webex-headless auth refresh --access-token-file` to publish a raw access
+  token for the JS realtime sidecar and any Rust process that needs to reply.
+- Use the JS SDK sidecar for low-latency `messages.created` events, and pair it
+  with `MultiRoomMessagePoller` REST catch-up for restart or network gaps.
+- Store processed message IDs and room checkpoints in `JsonlStateStore`; add the
+  `sqlite-state-cache` feature only when lookup pressure shows up in production.
+- Keep rule matching, handler dispatch, and product-specific configuration in
+  the downstream bot until the reusable shape is clear enough to promote here.
+- Start from `deploy/systemd/webex-headless-account-bot.target` for a single-host
+  Linux supervisor deployment, then replace `webex-account-bot` with the real
+  bot service when needed.
+
 ## Smoke Test
 
 For local validation against a real generic account, create `.env.webex-test`
@@ -562,6 +600,52 @@ then performs read/send/reply smoke checks.
 
 See [docs/smoke-testing.md](docs/smoke-testing.md) for Webex Integration setup,
 Device Grant authorization steps, expected output, and troubleshooting.
+
+## Release Process
+
+Releases are cut from the repository default branch with an annotated release
+tag whose name matches the `Cargo.toml` package version. The recommended path is
+to run the `Release` workflow manually from the default branch and provide a tag
+such as `v0.1.0`; after the `crates-io` environment is approved, the workflow
+creates and pushes that tag before publishing.
+
+The tag-push path is still supported when you need to create the tag locally:
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+The `Release` GitHub Actions workflow verifies that the release source is the
+current repository default branch, the tag matches `vMAJOR.MINOR.PATCH`, the
+manifest version matches the tag, no GitHub Release already exists for that
+version, and the requested version is not lower than existing release tags or
+published crates.io versions. It then runs the Rust and JS test gates, runs
+`cargo publish --dry-run`, waits for approval on the `crates-io` GitHub
+Environment, revalidates the verified commit SHA and live release availability,
+checks that the crates.io token secret is configured before tag creation,
+creates the tag if needed, publishes the crate to crates.io using that
+environment's `CARGO_REGISTRY_TOKEN` secret, and creates a GitHub Release from
+`CHANGELOG.md`. If the crate version is already on crates.io but the matching
+release tag exists and the GitHub Release is missing, the workflow skips
+`cargo publish` and only creates the missing GitHub Release.
+If the crates.io publish step rejects the token after tag creation, fix the
+environment secret and rerun the same tag; the workflow will reuse the existing
+tag and retry publishing.
+The first release publishes the library and operator/demo binaries through
+crates.io only; GitHub binary artifacts can be added later if the CLI becomes a
+standalone distribution target.
+
+Configure the `crates-io` environment with required reviewers before the first
+tagged release. Store the crates.io API token as an environment secret named
+`CARGO_REGISTRY_TOKEN`; a repository-level secret is not required. If you
+restrict deployments to selected branches and tags, allow both the repository
+default branch for manual `workflow_dispatch` runs and tag `v*.*.*` for tag-push
+releases.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
 
 ## References
 

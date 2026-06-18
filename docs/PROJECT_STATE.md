@@ -2,10 +2,10 @@
 
 ## Current State
 - 仓库已从 review-gate 模板切换为 `webex-headless-messenger` Rust library crate。
-- 首个 crate bootstrap slice 已完成；smoke docs、简单文件上传 helper、JS SDK realtime sidecar demo、thin CLI、production sidecar MVP、systemd supervisor templates、account bot example、Webex app room-link resolver、joined-room discovery、multi-room REST catch-up primitives、append-only JSONL state store、可选 SQLite state cache/index、命名 account bot binary 与 systemd account-bot stack 已完成；cards 仍按需评估。
+- 首个 crate bootstrap slice 已完成；smoke docs、简单文件上传 helper、JS SDK realtime sidecar demo、thin CLI、production sidecar MVP、systemd supervisor templates、account bot example、Webex app room-link resolver、joined-room discovery、multi-room REST catch-up primitives、append-only JSONL state store、可选 SQLite state cache/index、命名 account bot binary、systemd account-bot stack、Apache-2.0 license、crates.io metadata 与 direct tag release workflow 已完成；cards 仍按需评估。
 
 ## Recovery Pointers
-- Latest completed workstream: `docs/project_journal/2026/06/2026-06-18-thin-production-bot-layer.md`
+- Latest completed workstream: `docs/project_journal/2026/06/2026-06-18-release-readiness.md`
 - Local index: optional generated `docs/project_journal/INDEX.md`; regenerate with the bundled `project_journal.py generate` helper.
 
 ## Global Blockers

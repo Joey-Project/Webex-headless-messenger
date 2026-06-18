@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-18
 updated: 2026-06-18
 branch: wip/thin-production-bot-layer
-pr:
+pr: https://github.com/Joey-Project/Webex-headless-messenger/pull/14
 supersedes: 20260617-sqlite-state-cache
 superseded_by:
 ---

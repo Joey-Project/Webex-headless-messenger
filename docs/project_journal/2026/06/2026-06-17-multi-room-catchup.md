@@ -3,9 +3,9 @@ id: 20260617-multi-room-catchup
 title: Multi-Room Catch-Up
 status: completed
 created: 2026-06-17
-updated: 2026-06-17
+updated: 2026-06-18
 branch: wip/multi-room-catchup
-pr:
+pr: https://github.com/Joey-Project/Webex-headless-messenger/pull/11
 supersedes: 20260617-room-link-resolver
 superseded_by:
 ---

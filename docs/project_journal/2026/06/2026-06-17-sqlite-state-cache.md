@@ -3,9 +3,9 @@ id: 20260617-sqlite-state-cache
 title: SQLite State Cache
 status: completed
 created: 2026-06-17
-updated: 2026-06-17
+updated: 2026-06-18
 branch: wip/sqlite-state-cache
-pr:
+pr: https://github.com/Joey-Project/Webex-headless-messenger/pull/13
 supersedes: 20260617-jsonl-state-store
 superseded_by:
 ---

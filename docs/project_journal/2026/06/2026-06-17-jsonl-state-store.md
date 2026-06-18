@@ -3,9 +3,9 @@ id: 20260617-jsonl-state-store
 title: JSONL State Store
 status: completed
 created: 2026-06-17
-updated: 2026-06-17
+updated: 2026-06-18
 branch: wip/embedded-store
-pr:
+pr: https://github.com/Joey-Project/Webex-headless-messenger/pull/12
 supersedes: 20260617-multi-room-catchup
 superseded_by:
 ---

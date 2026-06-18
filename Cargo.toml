@@ -1,10 +1,16 @@
 [package]
 name = "webex-headless-messenger"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Headless async Rust bindings for Webex Messaging REST APIs and OAuth integrations."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+repository = "https://github.com/Joey-Project/Webex-headless-messenger"
+homepage = "https://github.com/Joey-Project/Webex-headless-messenger"
+documentation = "https://docs.rs/webex-headless-messenger"
+readme = "README.md"
+keywords = ["webex", "messaging", "oauth", "automation", "headless"]
+categories = ["api-bindings", "asynchronous", "web-programming::http-client", "command-line-utilities"]
 
 [dependencies]
 async-trait = "0.1"

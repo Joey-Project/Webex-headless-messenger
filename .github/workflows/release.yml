@@ -1,0 +1,529 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or publish, such as v0.1.0."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
+      create_tag: ${{ steps.meta.outputs.create_tag }}
+      publish_crate: ${{ steps.meta.outputs.publish_crate }}
+    steps:
+      - name: Resolve release ref
+        id: ref
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ -z "${INPUT_TAG}" ]]; then
+              echo "::error::tag input is required for workflow_dispatch"
+              exit 2
+            fi
+            if [[ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]]; then
+              echo "::error::manual releases must be dispatched from ${DEFAULT_BRANCH}, not ${GITHUB_REF_NAME}"
+              exit 2
+            fi
+            echo "ref=refs/heads/${DEFAULT_BRANCH}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "ref=${GITHUB_REF}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Validate tag and manifest
+        id: meta
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_TAG}"
+          fi
+          if [[ ! "${tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release tag must match vMAJOR.MINOR.PATCH: ${tag}"
+            exit 2
+          fi
+          version="${tag#v}"
+          version_key() {
+            local major minor patch
+            IFS=. read -r major minor patch <<< "$1"
+            printf '%010d.%010d.%010d' "$((10#${major}))" "$((10#${minor}))" "$((10#${patch}))"
+          }
+          version_key_value=$(version_key "${version}")
+          crate_name=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ -z "${crate_name}" ]]; then
+            echo "::error::could not read package name from Cargo.toml"
+            exit 2
+          fi
+          manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "${manifest_version}" != "${version}" ]]; then
+            echo "::error::Cargo.toml version ${manifest_version} does not match tag ${tag}"
+            exit 2
+          fi
+          release_response=$(mktemp)
+          if ! release_http_status=$(curl --silent --show-error \
+            --output "${release_response}" \
+            --write-out "%{http_code}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"); then
+            echo "::error::GitHub Release lookup for ${tag} failed"
+            cat "${release_response}" || true
+            exit 2
+          fi
+          case "${release_http_status}" in
+            200)
+              echo "::error::GitHub Release ${tag} already exists"
+              exit 2
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::GitHub Release lookup for ${tag} failed with HTTP ${release_http_status}"
+              cat "${release_response}" || true
+              exit 2
+              ;;
+          esac
+          rm -f "${release_response}"
+          max_tag_version=""
+          max_tag_key=""
+          tag_refs=$(git ls-remote --tags --refs origin "refs/tags/v*.*.*" | awk '{print $2}')
+          while IFS= read -r tag_ref; do
+            existing_tag="${tag_ref#refs/tags/}"
+            if [[ ! "${existing_tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              continue
+            fi
+            existing_version="${existing_tag#v}"
+            if [[ "${existing_version}" == "${version}" ]]; then
+              continue
+            fi
+            existing_key=$(version_key "${existing_version}")
+            if [[ -z "${max_tag_key}" || "${existing_key}" > "${max_tag_key}" ]]; then
+              max_tag_version="${existing_version}"
+              max_tag_key="${existing_key}"
+            fi
+          done <<< "${tag_refs}"
+          if [[ -n "${max_tag_key}" && "${version_key_value}" < "${max_tag_key}" ]]; then
+            echo "::error::release version ${version} is lower than existing release tag v${max_tag_version}"
+            exit 2
+          fi
+          published_versions=$(CRATE_NAME="${crate_name}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          crate_name = os.environ["CRATE_NAME"]
+          quoted = urllib.parse.quote(crate_name, safe="")
+          request = urllib.request.Request(
+              f"https://crates.io/api/v1/crates/{quoted}",
+              headers={
+                  "Accept": "application/json",
+                  "User-Agent": "github-actions-release-webex-headless-messenger",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  sys.exit(0)
+              raise
+          for version in payload.get("versions", []):
+              number = version.get("num")
+              if number:
+                  print(number)
+          PY
+          )
+          max_published_version=""
+          max_published_key=""
+          duplicate_published=false
+          while IFS= read -r published_version; do
+            if [[ -z "${published_version}" ]]; then
+              continue
+            fi
+            if [[ "${published_version}" == "${version}" ]]; then
+              duplicate_published=true
+            fi
+            if [[ ! "${published_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              continue
+            fi
+            published_key=$(version_key "${published_version}")
+            if [[ -z "${max_published_key}" || "${published_key}" > "${max_published_key}" ]]; then
+              max_published_version="${published_version}"
+              max_published_key="${published_key}"
+            fi
+          done <<< "${published_versions}"
+          if [[ "${duplicate_published}" == "true" ]]; then
+            publish_crate=false
+          else
+            publish_crate=true
+          fi
+          if [[ "${duplicate_published}" != "true" && -n "${max_published_key}" && "${version_key_value}" < "${max_published_key}" ]]; then
+            echo "::error::release version ${version} is lower than published crates.io version ${max_published_version}"
+            exit 2
+          fi
+          git fetch --no-tags origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          default_sha=$(git rev-parse "origin/${DEFAULT_BRANCH}")
+          head_sha=$(git rev-parse HEAD)
+          if [[ "${head_sha}" != "${default_sha}" ]]; then
+            echo "::error::release source ${head_sha} is not current origin/${DEFAULT_BRANCH} ${default_sha}"
+            exit 2
+          fi
+          create_tag=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_sha=$(git rev-list -n 1 "${tag}")
+            if [[ "${tag_sha}" != "${default_sha}" ]]; then
+              echo "::error::${tag} points at ${tag_sha}, but origin/${DEFAULT_BRANCH} is ${default_sha}"
+              exit 2
+            fi
+          elif [[ "${duplicate_published}" == "true" ]]; then
+            echo "::error::crate ${crate_name} version ${version} is already published, but ${tag} does not exist on origin"
+            exit 2
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            create_tag=true
+          else
+            echo "::error::${tag} was not found on origin"
+            exit 2
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "source_sha=${default_sha}"
+            echo "create_tag=${create_tag}"
+            echo "publish_crate=${publish_crate}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Rust format
+        run: cargo fmt --check
+
+      - name: Rust clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked
+
+      - name: Rust tests with all features
+        run: cargo test --locked --all-features
+
+      - name: Rust docs
+        run: cargo doc --locked --no-deps --all-features
+
+      - name: JavaScript sidecar tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          cd examples/sidecar-js
+          npm ci
+          node --check index.mjs
+          npm test
+
+      - name: Verify systemd units
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "systemd-analyze not available; skipping systemd unit verification"
+            exit 0
+          fi
+          root=$(mktemp -d)
+          trap 'rm -rf "${root}"' EXIT
+          mkdir -p "${root}/etc/systemd/system" "${root}/usr/local/bin" "${root}/usr/bin"
+          cp deploy/systemd/*.service deploy/systemd/*.target deploy/systemd/*.timer \
+            "${root}/etc/systemd/system/"
+          printf '[Unit]\nDescription=System Initialization\n' \
+            > "${root}/etc/systemd/system/sysinit.target"
+          install -m 0755 /bin/true "${root}/usr/local/bin/webex-headless"
+          install -m 0755 /bin/true "${root}/usr/local/bin/webex-account-bot"
+          install -m 0755 /bin/true "${root}/usr/bin/env"
+          install -m 0755 /bin/true "${root}/usr/bin/node"
+          systemd-analyze verify --root="${root}" \
+            webex-headless-sidecar.target \
+            webex-headless-sidecar-receiver.service \
+            webex-headless-sidecar-js.service \
+            webex-headless-account-bot.target \
+            webex-headless-account-bot.service \
+            webex-headless-account-bot-sidecar-js.service \
+            webex-headless-token-refresh.service \
+            webex-headless-token-refresh.timer
+
+      - name: Crates.io dry run
+        run: cargo publish --dry-run --locked
+
+  publish:
+    name: Publish crate and GitHub Release
+    runs-on: ubuntu-latest
+    needs: verify
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/webex-headless-messenger
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Revalidate release state
+        id: live
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release tag must match vMAJOR.MINOR.PATCH: ${TAG}"
+            exit 2
+          fi
+          version="${TAG#v}"
+          version_key() {
+            local major minor patch
+            IFS=. read -r major minor patch <<< "$1"
+            printf '%010d.%010d.%010d' "$((10#${major}))" "$((10#${minor}))" "$((10#${patch}))"
+          }
+          version_key_value=$(version_key "${version}")
+          crate_name=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ -z "${crate_name}" ]]; then
+            echo "::error::could not read package name from Cargo.toml"
+            exit 2
+          fi
+          manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "${manifest_version}" != "${version}" ]]; then
+            echo "::error::Cargo.toml version ${manifest_version} does not match tag ${TAG}"
+            exit 2
+          fi
+          git fetch --no-tags origin "${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          current_default_sha=$(git rev-parse "origin/${DEFAULT_BRANCH}")
+          if [[ "${current_default_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "::error::origin/${DEFAULT_BRANCH} moved from ${SOURCE_SHA} to ${current_default_sha}; rerun the release workflow"
+            exit 2
+          fi
+          release_response=$(mktemp)
+          if ! release_http_status=$(curl --silent --show-error \
+            --output "${release_response}" \
+            --write-out "%{http_code}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"); then
+            echo "::error::GitHub Release lookup for ${TAG} failed"
+            cat "${release_response}" || true
+            exit 2
+          fi
+          case "${release_http_status}" in
+            200)
+              echo "::error::GitHub Release ${TAG} already exists"
+              exit 2
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::GitHub Release lookup for ${TAG} failed with HTTP ${release_http_status}"
+              cat "${release_response}" || true
+              exit 2
+              ;;
+          esac
+          rm -f "${release_response}"
+          max_tag_version=""
+          max_tag_key=""
+          tag_refs=$(git ls-remote --tags --refs origin "refs/tags/v*.*.*" | awk '{print $2}')
+          while IFS= read -r tag_ref; do
+            existing_tag="${tag_ref#refs/tags/}"
+            if [[ ! "${existing_tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              continue
+            fi
+            existing_version="${existing_tag#v}"
+            if [[ "${existing_version}" == "${version}" ]]; then
+              continue
+            fi
+            existing_key=$(version_key "${existing_version}")
+            if [[ -z "${max_tag_key}" || "${existing_key}" > "${max_tag_key}" ]]; then
+              max_tag_version="${existing_version}"
+              max_tag_key="${existing_key}"
+            fi
+          done <<< "${tag_refs}"
+          if [[ -n "${max_tag_key}" && "${version_key_value}" < "${max_tag_key}" ]]; then
+            echo "::error::release version ${version} is lower than existing release tag v${max_tag_version}"
+            exit 2
+          fi
+          create_tag=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            tag_sha=$(git rev-list -n 1 "${TAG}")
+            if [[ "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+              echo "::error::${TAG} points at ${tag_sha}, but verified source is ${SOURCE_SHA}"
+              exit 2
+            fi
+          else
+            create_tag=true
+          fi
+          published_versions=$(CRATE_NAME="${crate_name}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          crate_name = os.environ["CRATE_NAME"]
+          quoted = urllib.parse.quote(crate_name, safe="")
+          request = urllib.request.Request(
+              f"https://crates.io/api/v1/crates/{quoted}",
+              headers={
+                  "Accept": "application/json",
+                  "User-Agent": "github-actions-release-webex-headless-messenger",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  sys.exit(0)
+              raise
+          for version in payload.get("versions", []):
+              number = version.get("num")
+              if number:
+                  print(number)
+          PY
+          )
+          max_published_version=""
+          max_published_key=""
+          duplicate_published=false
+          while IFS= read -r published_version; do
+            if [[ -z "${published_version}" ]]; then
+              continue
+            fi
+            if [[ "${published_version}" == "${version}" ]]; then
+              duplicate_published=true
+            fi
+            if [[ ! "${published_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              continue
+            fi
+            published_key=$(version_key "${published_version}")
+            if [[ -z "${max_published_key}" || "${published_key}" > "${max_published_key}" ]]; then
+              max_published_version="${published_version}"
+              max_published_key="${published_key}"
+            fi
+          done <<< "${published_versions}"
+          if [[ "${duplicate_published}" == "true" ]]; then
+            publish_crate=false
+          else
+            publish_crate=true
+          fi
+          if [[ "${duplicate_published}" != "true" && -n "${max_published_key}" && "${version_key_value}" < "${max_published_key}" ]]; then
+            echo "::error::release version ${version} is lower than published crates.io version ${max_published_version}"
+            exit 2
+          fi
+          if [[ "${duplicate_published}" == "true" && "${create_tag}" == "true" ]]; then
+            echo "::error::crate ${crate_name} version ${version} is already published, but ${TAG} does not exist on origin"
+            exit 2
+          fi
+          {
+            echo "create_tag=${create_tag}"
+            echo "publish_crate=${publish_crate}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check crates.io token secret
+        if: steps.live.outputs.publish_crate == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is required to publish the crate"
+            exit 2
+          fi
+
+      - name: Create release tag
+        if: steps.live.outputs.create_tag == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} already exists and points at ${SOURCE_SHA}; skipping tag creation"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" "${SOURCE_SHA}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Publish to crates.io
+        if: steps.live.outputs.publish_crate == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Extract release notes
+        shell: bash
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          awk -v tag="${TAG}" '
+            $0 == "## " tag || index($0, "## " tag " ") == 1 { in_section = 1; next }
+            /^## / && in_section { exit }
+            in_section { print }
+          ' CHANGELOG.md > .release-notes.md
+          if [[ ! -s .release-notes.md ]]; then
+            printf 'Release %s\n' "${TAG}" > .release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: gh release create "${TAG}" --title "${TAG}" --notes-file .release-notes.md --verify-tag
